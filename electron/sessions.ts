@@ -4,6 +4,7 @@ import { extractDoubaoIdentity } from "./identity.js";
 
 const DOUBAO_HOME = "https://www.doubao.com/";
 const DOUBAO_CHAT = "https://www.doubao.com/chat/";
+const DOUBAO_ACCOUNT_INFO = "/passport/account/info/v2/?aid=497858&account_sdk_source=web&sdk_version=2.2.11-doubao.0&device_platform=web";
 
 export class AccountSessionManager {
   private readonly windows = new Map<string, BrowserWindow>();
@@ -66,7 +67,10 @@ export class AccountSessionManager {
     try {
       await waitForLoad(win!);
       const payload = await win!.webContents.executeJavaScript(`
-        fetch('/passport/web/account/info/', { credentials: 'include' })
+        fetch(${JSON.stringify(DOUBAO_ACCOUNT_INFO)}, {
+          credentials: 'include',
+          headers: { accept: 'application/json, text/plain, */*' }
+        })
           .then(async response => ({ status: response.status, body: await response.json() }))
       `, true) as { status: number; body: unknown };
       if (payload.status !== 200) throw new Error(`账号接口返回 HTTP ${payload.status}`);

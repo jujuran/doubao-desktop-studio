@@ -9,13 +9,35 @@ export function extractDoubaoIdentity(payload: unknown): DoubaoIdentity | null {
   const root = payload as Record<string, unknown>;
   const data = asRecord(root.data) ?? root;
   const user = asRecord(data.user) ?? asRecord(data.account) ?? data;
-  const userId = firstString(user.user_id, user.userId, user.uid, user.id, data.user_id, data.userId);
+  const userId = firstIdentifier(
+    user.user_id_str,
+    user.sec_user_id,
+    user.user_id,
+    user.userId,
+    user.uid,
+    user.id,
+    data.user_id_str,
+    data.sec_user_id,
+    data.user_id,
+    data.userId
+  );
   if (!userId) return null;
   return {
     userId,
-    displayName: firstString(user.name, user.nickname, user.nick_name, user.display_name) || null,
+    displayName: firstString(
+      user.name,
+      user.nickname,
+      user.nick_name,
+      user.display_name,
+      user.screen_name
+    ) || null,
     avatarUrl: firstString(user.avatar_url, user.avatarUrl, user.avatar, user.avatar_thumb) || null
   };
+}
+
+function firstIdentifier(...values: unknown[]) {
+  const result = firstString(...values);
+  return result === "0" ? "" : result;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
