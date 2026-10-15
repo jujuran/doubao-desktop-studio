@@ -22,15 +22,20 @@ jobs:
   package:
     needs: verify
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             command: npm run dist:win
-            artifact: release/*
+            artifact: |
+              release/*.exe
+              release/*.zip
             name: windows
           - os: macos-latest
             command: npm run dist:mac
-            artifact: release/*
+            artifact: |
+              release/*.dmg
+              release/*.zip
             name: macos
     runs-on: ${{ matrix.os }}
     steps:

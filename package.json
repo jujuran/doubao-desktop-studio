@@ -17,8 +17,8 @@
     "build": "npm run build:renderer && npm run build:electron",
     "test": "vitest run",
     "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
-    "dist:win": "npm run build && electron-builder --win nsis zip --x64",
-    "dist:mac": "npm run build && electron-builder --mac dmg zip --x64 --arm64"
+    "dist:win": "npm run build && electron-builder --win nsis zip --x64 --publish never",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip --x64 --arm64 --publish never"
   },
   "dependencies": {
     "vue": "^3.5.22"
