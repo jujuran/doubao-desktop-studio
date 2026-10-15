@@ -28,14 +28,16 @@ jobs:
           - os: windows-latest
             command: npm run dist:win
             artifact: |
-              release/*.exe
-              release/*.zip
+              release/current/*.exe
+              release/current/*.zip
+              release/current/SHA256SUMS.txt
             name: windows
           - os: macos-latest
             command: npm run dist:mac
             artifact: |
-              release/*.dmg
-              release/*.zip
+              release/current/*.dmg
+              release/current/*.zip
+              release/current/SHA256SUMS.txt
             name: macos
     runs-on: ${{ matrix.os }}
     steps:

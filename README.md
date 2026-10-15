@@ -49,6 +49,8 @@ npm run dist:win
 npm run dist:mac
 ```
 
+本地构建产物统一放在 `release/current/`。每次打包前会自动清理该目录，打包完成后只保留当前版本的安装包、压缩包和 `SHA256SUMS.txt`；历史版本由 GitHub Releases 保存。
+
 macOS 安装包必须在 macOS 上生成；正式分发前还需要配置 Apple Developer ID、公证，以及 Windows 代码签名。
 
 ## 数据与安全
