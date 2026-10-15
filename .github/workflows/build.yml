@@ -1,0 +1,47 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  package:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            command: npm run dist:win
+            artifact: release/*
+            name: windows
+          - os: macos-latest
+            command: npm run dist:mac
+            artifact: release/*
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doubao-desktop-studio-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
