@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
   accounts: {
     list: () => ipcRenderer.invoke("accounts:list"),
     create: (label) => ipcRenderer.invoke("accounts:create", label),
+    rename: (id, label) => ipcRenderer.invoke("accounts:rename", id, label),
     open: (id) => ipcRenderer.invoke("accounts:open", id),
     verify: (id) => ipcRenderer.invoke("accounts:verify", id),
     clearCache: (id) => ipcRenderer.invoke("accounts:clear-cache", id),
@@ -21,7 +22,8 @@ contextBridge.exposeInMainWorld("desktopApi", {
   },
   runtime: {
     stats: () => ipcRenderer.invoke("runtime:stats"),
-    chooseDataDirectory: () => ipcRenderer.invoke("runtime:choose-data-directory")
+    chooseDataDirectory: () => ipcRenderer.invoke("runtime:choose-data-directory"),
+    exportDiagnostics: () => ipcRenderer.invoke("runtime:export-diagnostics")
   },
   onDataChanged: (callback) => {
     const listener = () => callback();

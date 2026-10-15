@@ -73,12 +73,15 @@ h2 { margin: 6px 0 9px; font: 600 21px Georgia, "Songti SC", serif; }
 .avatar { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: #28513a; background: var(--green-soft); font-weight: 800; }
 .badge { display: inline-flex; padding: 4px 8px; border-radius: 20px; color: #6d746a; background: #eceee9; font-size: 10px; font-weight: 700; }
 .badge.ready, .badge.succeeded { color: #28623f; background: #dceee1; }
+.badge.login_required { color: #984237; background: #f7dfda; }
 .badge.running, .badge.busy { color: #775917; background: #f6eac8; }
 .badge.failed, .badge.error { color: #984237; background: #f7dfda; }
 .account-card h3 { margin: 16px 0 4px; font-size: 16px; }
 .account-card p { margin: 0 0 11px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .account-card code { display: block; color: #788077; font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
 .account-card > small { display: block; margin-top: 10px; color: #979d94; }
+.account-card > small.window-open { color: var(--green); }
+.window-open .live-dot { width: 6px; height: 6px; margin-right: 6px; box-shadow: 0 0 0 3px #e1efe5; }
 .card-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 17px; }
 .card-actions button { font-size: 11px; }
 

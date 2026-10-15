@@ -35,6 +35,15 @@ describe("StudioDatabase", () => {
     db.close();
   });
 
+  it("updates a local account label without changing its partition", () => {
+    const db = createDatabase();
+    const account = db.createAccount("原备注");
+    const renamed = db.renameAccount(account.id, "新备注");
+    expect(renamed.label).toBe("新备注");
+    expect(renamed.partition).toBe(account.partition);
+    db.close();
+  });
+
   it("clamps worker concurrency to a memory-safe range", () => {
     const db = createDatabase();
     expect(db.updateSettings({ maxActiveWorkers: 20 }).maxActiveWorkers).toBe(3);

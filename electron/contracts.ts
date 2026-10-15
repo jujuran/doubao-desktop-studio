@@ -34,10 +34,13 @@ export interface AppSettings {
 }
 
 export interface RuntimeStats {
+  version: string;
   totalPrivateMb: number;
   processCount: number;
   activeAccountWindows: number;
+  activeAccountIds: string[];
   dataPath: string;
+  logPath: string;
   dataPathNotice: string | null;
 }
 
@@ -46,6 +49,12 @@ export interface DataDirectoryChangeResult {
   restartScheduled: boolean;
   message: string;
   targetPath?: string;
+}
+
+export interface DiagnosticsExportResult {
+  cancelled: boolean;
+  message: string;
+  filePath?: string;
 }
 
 export interface IdentityResult {
@@ -58,6 +67,7 @@ export interface DesktopApi {
   accounts: {
     list(): Promise<Account[]>;
     create(label: string): Promise<Account>;
+    rename(id: string, label: string): Promise<Account>;
     open(id: string): Promise<void>;
     verify(id: string): Promise<IdentityResult>;
     clearCache(id: string): Promise<void>;
@@ -76,6 +86,7 @@ export interface DesktopApi {
   runtime: {
     stats(): Promise<RuntimeStats>;
     chooseDataDirectory(): Promise<DataDirectoryChangeResult>;
+    exportDiagnostics(): Promise<DiagnosticsExportResult>;
   };
   onDataChanged(callback: () => void): () => void;
 }

@@ -9,12 +9,23 @@ const activeTab = ref<Tab>("overview");
 const accounts = ref<Account[]>([]);
 const tasks = ref<TaskRecord[]>([]);
 const settings = ref<AppSettings>({ maxActiveWorkers: 2, automationEnabled: false });
-const runtime = ref<RuntimeStats>({ totalPrivateMb: 0, processCount: 0, activeAccountWindows: 0, dataPath: "", dataPathNotice: null });
+const runtime = ref<RuntimeStats>({
+  version: "",
+  totalPrivateMb: 0,
+  processCount: 0,
+  activeAccountWindows: 0,
+  activeAccountIds: [],
+  dataPath: "",
+  logPath: "",
+  dataPathNotice: null
+});
 const loading = ref(true);
 const notice = ref("");
 const noticeError = ref(false);
 const newAccountLabel = ref("");
 const showAccountDialog = ref(false);
+const renameAccountTarget = ref<Account | null>(null);
+const renameAccountLabel = ref("");
 const taskForm = reactive({ accountId: "", prompt: "", model: "Seedance", duration: 10, aspectRatio: "9:16" });
 
 const readyAccounts = computed(() => accounts.value.filter((account) => account.status === "ready"));
@@ -87,6 +98,20 @@ async function openAccount(account: Account) {
   });
 }
 
+function openRenameAccount(account: Account) {
+  renameAccountTarget.value = account;
+  renameAccountLabel.value = account.label;
+}
+
+async function renameAccount() {
+  if (!renameAccountTarget.value) return;
+  await act(async () => {
+    await window.desktopApi.accounts.rename(renameAccountTarget.value!.id, renameAccountLabel.value);
+    renameAccountTarget.value = null;
+    flash("账号备注已更新");
+  });
+}
+
 async function clearAccountCache(account: Account) {
   await act(async () => {
     await window.desktopApi.accounts.clearCache(account.id);
@@ -145,6 +170,13 @@ async function chooseDataDirectory() {
   });
 }
 
+async function exportDiagnostics() {
+  await act(async () => {
+    const result = await window.desktopApi.runtime.exportDiagnostics();
+    flash(result.message);
+  });
+}
+
 async function act(operation: () => Promise<void>) {
   try {
     await operation();
@@ -186,6 +218,15 @@ function statusLabel(status: string) {
   } as Record<string, string>)[status] || status;
 }
 
+function accountStatusLabel(account: Account) {
+  if (account.status === "login_required" && account.doubaoUserId) return "登录失效";
+  return statusLabel(account.status);
+}
+
+function isAccountWindowOpen(accountId: string) {
+  return runtime.value.activeAccountIds.includes(accountId);
+}
+
 function shortId(value: string | null) {
   if (!value) return "尚未确认 UID";
   return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
@@ -203,7 +244,7 @@ function formatTime(value: string) {
         <img class="brand-mark" :src="appIcon" alt="" />
         <div>
           <strong>Doubao Studio</strong>
-          <span>本地账号工作台</span>
+          <span>本地账号工作台{{ runtime.version ? ` · v${runtime.version}` : '' }}</span>
         </div>
       </div>
 
@@ -255,7 +296,7 @@ function formatTime(value: string) {
         <section class="section-heading"><div><p class="eyebrow">RECENT ACCOUNTS</p><h2>最近账号</h2></div><button class="text-button" @click="activeTab = 'accounts'">查看全部 →</button></section>
         <section v-if="accounts.length" class="account-grid compact">
           <article v-for="account in accounts.slice(0, 4)" :key="account.id" class="account-card">
-            <div class="account-head"><div class="avatar">{{ account.label.slice(0, 1) }}</div><span class="badge" :class="account.status">{{ statusLabel(account.status) }}</span></div>
+            <div class="account-head"><div class="avatar">{{ account.label.slice(0, 1) }}</div><span class="badge" :class="account.status">{{ accountStatusLabel(account) }}</span></div>
             <h3>{{ account.label }}</h3><p>{{ account.displayName || '尚未读取豆包昵称' }}</p><code>{{ shortId(account.doubaoUserId) }}</code>
           </article>
         </section>
@@ -266,12 +307,14 @@ function formatTime(value: string) {
         <section class="section-heading"><div><p class="eyebrow">PERSISTENT PARTITIONS</p><h2>{{ accounts.length }} 个隔离空间</h2></div><p class="muted">Cookie 不写入数据库，也不会在账号之间复制。</p></section>
         <section v-if="accounts.length" class="account-grid">
           <article v-for="account in accounts" :key="account.id" class="account-card detailed">
-            <div class="account-head"><div class="avatar">{{ account.label.slice(0, 1) }}</div><span class="badge" :class="account.status">{{ statusLabel(account.status) }}</span></div>
+            <div class="account-head"><div class="avatar">{{ account.label.slice(0, 1) }}</div><span class="badge" :class="account.status">{{ accountStatusLabel(account) }}</span></div>
             <h3>{{ account.label }}</h3><p>{{ account.displayName || '打开窗口并登录后进行确认' }}</p><code>{{ shortId(account.doubaoUserId) }}</code>
             <small v-if="account.lastVerifiedAt">上次确认：{{ formatTime(account.lastVerifiedAt) }}</small>
+            <small v-if="isAccountWindowOpen(account.id)" class="window-open"><span class="live-dot"></span>窗口已打开</small>
             <div class="card-actions">
               <button class="primary small" @click="openAccount(account)">打开</button>
               <button @click="verifyAccount(account)">确认账号</button>
+              <button @click="openRenameAccount(account)">改备注</button>
               <button @click="clearAccountCache(account)">清缓存</button>
               <button class="danger" @click="removeAccount(account)">删除</button>
             </div>
@@ -315,12 +358,16 @@ function formatTime(value: string) {
           <article class="panel setting-card"><p class="eyebrow">CONCURRENCY</p><h2>活动 Worker 上限</h2><p class="muted">账号可以有 20 个，但豆包窗口默认最多同时保留 2 个。</p><div class="stepper"><button @click="settings.maxActiveWorkers = Math.max(1, settings.maxActiveWorkers - 1)">−</button><strong>{{ settings.maxActiveWorkers }}</strong><button @click="settings.maxActiveWorkers = Math.min(3, settings.maxActiveWorkers + 1)">＋</button></div><button class="primary" @click="saveSettings">保存设置</button></article>
           <article class="panel setting-card"><p class="eyebrow">LOCAL DATA</p><h2>数据目录</h2><p class="muted">账号会话、SQLite 数据库和缓存仅保存在本机。</p><code class="path">{{ runtime.dataPath }}</code><p v-if="runtime.dataPathNotice" class="migration-warning">{{ runtime.dataPathNotice }}</p><button @click="chooseDataDirectory">更改目录</button><p class="security-note">迁移时保留原目录作为备份；不保存密码、短信验证码或 2FA 密钥。</p></article>
           <article class="panel setting-card"><p class="eyebrow">AUTOMATION</p><h2>自动执行适配器</h2><p class="muted">核心接口已经隔离，当前默认保持关闭。下一阶段接入豆包页面适配器后再开放。</p><span class="coming">准备中</span></article>
+          <article class="panel setting-card"><p class="eyebrow">DIAGNOSTICS</p><h2>诊断信息</h2><p class="muted">版本 v{{ runtime.version }}。日志只记录程序事件和错误，不记录 Cookie、密码或验证码。</p><code class="path">{{ runtime.logPath }}</code><button @click="exportDiagnostics">导出诊断信息</button><p class="security-note">发送诊断文件前仍建议自行检查内容。</p></article>
         </section>
       </template>
     </main>
 
     <div v-if="showAccountDialog" class="modal-backdrop" @click.self="showAccountDialog = false">
       <form class="modal" @submit.prevent="createAccount"><p class="eyebrow">NEW ISOLATED SESSION</p><h2>添加豆包账号</h2><p class="muted">名称只是本地备注，不会修改豆包昵称。</p><label>本地备注<input v-model="newAccountLabel" autofocus required /></label><div class="modal-actions"><button type="button" @click="showAccountDialog = false">取消</button><button class="primary" type="submit">创建并打开登录</button></div></form>
+    </div>
+    <div v-if="renameAccountTarget" class="modal-backdrop" @click.self="renameAccountTarget = null">
+      <form class="modal" @submit.prevent="renameAccount"><p class="eyebrow">LOCAL LABEL</p><h2>修改账号备注</h2><p class="muted">只修改工作台里的本地备注，不会修改豆包昵称。</p><label>本地备注<input v-model="renameAccountLabel" autofocus maxlength="60" required /></label><div class="modal-actions"><button type="button" @click="renameAccountTarget = null">取消</button><button class="primary" type="submit">保存备注</button></div></form>
     </div>
   </div>
 </template>

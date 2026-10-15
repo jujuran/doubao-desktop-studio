@@ -78,6 +78,15 @@ export class StudioDatabase {
     return this.getAccount(id);
   }
 
+  renameAccount(id: string, label: string): Account {
+    const trimmed = label.trim();
+    if (!trimmed) throw new Error("账号备注不能为空");
+    if (trimmed.length > 60) throw new Error("账号备注不能超过 60 个字符");
+    this.getAccount(id);
+    this.db.prepare("UPDATE accounts SET label = ? WHERE id = ?").run(trimmed, id);
+    return this.getAccount(id);
+  }
+
   updateIdentity(id: string, identity: { userId: string; displayName?: string | null; avatarUrl?: string | null }): Account {
     const duplicate = this.db.prepare("SELECT id FROM accounts WHERE doubao_user_id = ? AND id != ?").get(identity.userId, id) as DbRow | undefined;
     if (duplicate) throw new Error("这个豆包账号已经添加过了");
