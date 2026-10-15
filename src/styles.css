@@ -22,7 +22,7 @@ button { cursor: pointer; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 238px 1fr; }
 .sidebar { position: fixed; inset: 0 auto 0 0; width: 238px; padding: 28px 20px; color: #edf3eb; background: #202a22; display: flex; flex-direction: column; z-index: 10; }
 .brand { display: flex; gap: 12px; align-items: center; padding: 0 8px 30px; }
-.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; font: 700 19px Georgia, serif; color: #203024; background: #cde5d1; }
+.brand-mark { width: 38px; height: 38px; display: block; border-radius: 12px; object-fit: cover; box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
 .brand strong, .brand span { display: block; }
 .brand strong { font-size: 15px; letter-spacing: .2px; }
 .brand span { margin-top: 3px; color: #aeb9ad; font-size: 11px; }

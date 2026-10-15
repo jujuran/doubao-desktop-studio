@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import type { Account, AppSettings, RuntimeStats, TaskRecord, TaskStatus } from "../electron/contracts";
+import appIcon from "./assets/app-icon.png";
 
 type Tab = "overview" | "accounts" | "tasks" | "settings";
 
@@ -191,7 +192,7 @@ function formatTime(value: string) {
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">D</div>
+        <img class="brand-mark" :src="appIcon" alt="" />
         <div>
           <strong>Doubao Studio</strong>
           <span>本地账号工作台</span>

@@ -1,6 +1,6 @@
 {
   "name": "doubao-desktop-studio",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "author": "jujuran",
   "description": "Cross-platform, local-first workspace for isolated Doubao account sessions.",
@@ -50,6 +50,7 @@
       "package.json"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "nsis",
         "zip"
@@ -57,6 +58,7 @@
       "artifactName": "${productName}-${version}-windows-${arch}.${ext}"
     },
     "mac": {
+      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"
