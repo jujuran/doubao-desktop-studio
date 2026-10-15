@@ -20,7 +20,8 @@ contextBridge.exposeInMainWorld("desktopApi", {
     update: (input) => ipcRenderer.invoke("settings:update", input)
   },
   runtime: {
-    stats: () => ipcRenderer.invoke("runtime:stats")
+    stats: () => ipcRenderer.invoke("runtime:stats"),
+    chooseDataDirectory: () => ipcRenderer.invoke("runtime:choose-data-directory")
   },
   onDataChanged: (callback) => {
     const listener = () => callback();

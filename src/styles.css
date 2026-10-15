@@ -104,6 +104,8 @@ input:focus, textarea:focus, select:focus { border-color: #79a388; box-shadow: 0
 .stepper button { border: 0; border-radius: 0; }
 .stepper strong { text-align: center; }
 .path { display: block; padding: 11px; border-radius: 8px; color: #5d665b; background: #edf0e9; word-break: break-all; font-size: 10px; line-height: 1.5; }
+.path + button, .migration-warning + button { margin-top: 14px; }
+.migration-warning { margin: 10px 0 0; color: var(--red); font-size: 11px; line-height: 1.5; }
 .security-note { color: var(--green); font-size: 11px; }
 .coming { display: inline-flex; margin-top: 20px; padding: 7px 10px; border-radius: 8px; color: #6c725f; background: #ececdf; font-size: 11px; }
 

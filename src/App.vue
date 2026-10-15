@@ -9,7 +9,7 @@ const activeTab = ref<Tab>("overview");
 const accounts = ref<Account[]>([]);
 const tasks = ref<TaskRecord[]>([]);
 const settings = ref<AppSettings>({ maxActiveWorkers: 2, automationEnabled: false });
-const runtime = ref<RuntimeStats>({ totalPrivateMb: 0, processCount: 0, activeAccountWindows: 0, dataPath: "" });
+const runtime = ref<RuntimeStats>({ totalPrivateMb: 0, processCount: 0, activeAccountWindows: 0, dataPath: "", dataPathNotice: null });
 const loading = ref(true);
 const notice = ref("");
 const noticeError = ref(false);
@@ -134,6 +134,14 @@ async function saveSettings() {
   await act(async () => {
     settings.value = await window.desktopApi.settings.update({ maxActiveWorkers: settings.value.maxActiveWorkers });
     flash("设置已保存");
+  });
+}
+
+async function chooseDataDirectory() {
+  if (!window.confirm("更改数据目录会复制账号登录状态、数据库和设置，并自动重启应用。旧目录会暂时保留作为备份。继续吗？")) return;
+  await act(async () => {
+    const result = await window.desktopApi.runtime.chooseDataDirectory();
+    flash(result.message);
   });
 }
 
@@ -305,7 +313,7 @@ function formatTime(value: string) {
       <template v-else>
         <section class="settings-grid">
           <article class="panel setting-card"><p class="eyebrow">CONCURRENCY</p><h2>活动 Worker 上限</h2><p class="muted">账号可以有 20 个，但豆包窗口默认最多同时保留 2 个。</p><div class="stepper"><button @click="settings.maxActiveWorkers = Math.max(1, settings.maxActiveWorkers - 1)">−</button><strong>{{ settings.maxActiveWorkers }}</strong><button @click="settings.maxActiveWorkers = Math.min(3, settings.maxActiveWorkers + 1)">＋</button></div><button class="primary" @click="saveSettings">保存设置</button></article>
-          <article class="panel setting-card"><p class="eyebrow">LOCAL DATA</p><h2>数据目录</h2><p class="muted">账号会话、SQLite 数据库和缓存仅保存在本机。</p><code class="path">{{ runtime.dataPath }}</code><p class="security-note">不保存密码、短信验证码或 2FA 密钥。</p></article>
+          <article class="panel setting-card"><p class="eyebrow">LOCAL DATA</p><h2>数据目录</h2><p class="muted">账号会话、SQLite 数据库和缓存仅保存在本机。</p><code class="path">{{ runtime.dataPath }}</code><p v-if="runtime.dataPathNotice" class="migration-warning">{{ runtime.dataPathNotice }}</p><button @click="chooseDataDirectory">更改目录</button><p class="security-note">迁移时保留原目录作为备份；不保存密码、短信验证码或 2FA 密钥。</p></article>
           <article class="panel setting-card"><p class="eyebrow">AUTOMATION</p><h2>自动执行适配器</h2><p class="muted">核心接口已经隔离，当前默认保持关闭。下一阶段接入豆包页面适配器后再开放。</p><span class="coming">准备中</span></article>
         </section>
       </template>

@@ -1,8 +1,16 @@
 import path from "node:path";
-import { app, BrowserWindow, clipboard, ipcMain } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
 import type { AppSettings, TaskRecord, TaskStatus } from "./contracts.js";
+import { initializeDataLocation, scheduleDataMigration } from "./data-location.js";
 import { StudioDatabase } from "./database.js";
 import { AccountSessionManager } from "./sessions.js";
+
+const appDataPath = app.getPath("appData");
+const defaultUserDataPath = app.getPath("userData");
+const dataLocation = initializeDataLocation(appDataPath, defaultUserDataPath);
+if (dataLocation.userDataPath !== defaultUserDataPath) {
+  app.setPath("userData", dataLocation.userDataPath);
+}
 
 let mainWindow: BrowserWindow | null = null;
 let database: StudioDatabase;
@@ -107,7 +115,34 @@ function registerIpc() {
       totalPrivateMb: Math.round(totalPrivateKb / 1024),
       processCount: metrics.length,
       activeAccountWindows: sessions.activeWindowCount,
-      dataPath: app.getPath("userData")
+      dataPath: app.getPath("userData"),
+      dataPathNotice: dataLocation.notice
+    };
+  });
+  ipcMain.handle("runtime:choose-data-directory", async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "选择豆包工作台数据存放位置",
+      buttonLabel: "选择此位置",
+      properties: ["openDirectory", "createDirectory"]
+    };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) {
+      return { cancelled: true, restartScheduled: false, message: "已取消更改数据目录" };
+    }
+
+    const targetPath = scheduleDataMigration(appDataPath, app.getPath("userData"), result.filePaths[0]);
+    setTimeout(() => {
+      app.relaunch();
+      app.quit();
+    }, 800);
+    return {
+      cancelled: false,
+      restartScheduled: true,
+      targetPath,
+      message: `数据将在重启时迁移到：${targetPath}`
     };
   });
 }

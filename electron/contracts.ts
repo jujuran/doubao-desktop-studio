@@ -38,6 +38,14 @@ export interface RuntimeStats {
   processCount: number;
   activeAccountWindows: number;
   dataPath: string;
+  dataPathNotice: string | null;
+}
+
+export interface DataDirectoryChangeResult {
+  cancelled: boolean;
+  restartScheduled: boolean;
+  message: string;
+  targetPath?: string;
 }
 
 export interface IdentityResult {
@@ -67,6 +75,7 @@ export interface DesktopApi {
   };
   runtime: {
     stats(): Promise<RuntimeStats>;
+    chooseDataDirectory(): Promise<DataDirectoryChangeResult>;
   };
   onDataChanged(callback: () => void): () => void;
 }
