@@ -4,6 +4,8 @@ import { extractDoubaoIdentity, type DoubaoIdentity } from "./identity.js";
 
 const DOUBAO_HOME = "https://www.doubao.com/";
 const DOUBAO_CHAT = "https://www.doubao.com/chat/";
+const DOUBAO_IMAGE = "https://www.doubao.com/chat/create-image";
+const DOUBAO_VIDEO = "https://www.doubao.com/chat/create-video";
 const DOUBAO_ACCOUNT_INFO = "/passport/account/info/v2/?aid=497858&account_sdk_source=web&sdk_version=2.2.11-doubao.0&device_platform=web";
 const LOGIN_CHECK_INTERVAL = 10_000;
 const HEALTH_CHECK_INTERVAL = 5 * 60_000;
@@ -36,14 +38,14 @@ export class AccountSessionManager {
     return [...this.windows.keys()];
   }
 
-  open(account: Account, route: "home" | "chat" = "home", visible = true) {
+  open(account: Account, route: "home" | "chat" | "image" | "video" = "home", visible = true) {
     const existing = this.windows.get(account.id);
     if (existing && !existing.isDestroyed()) {
       if (visible) {
         existing.show();
         existing.focus();
       }
-      if (route === "chat") void existing.loadURL(DOUBAO_CHAT);
+      if (route !== "home") void existing.loadURL(routeUrl(route));
       this.scheduleMonitor(account, existing, 250);
       return existing;
     }
@@ -95,8 +97,19 @@ export class AccountSessionManager {
       route,
       visible
     });
-    void win.loadURL(route === "chat" ? DOUBAO_CHAT : DOUBAO_HOME);
+    void win.loadURL(routeUrl(route));
     return win;
+  }
+
+  async prepare(account: Account, route: "image" | "video", prompt: string) {
+    const win = this.open(account, route, true);
+    await waitForLoad(win);
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline) {
+      if (await fillComposer(win, prompt)) return win;
+      await delay(400);
+    }
+    throw new Error("已打开豆包页面，但没有找到提示词输入框；请手动粘贴，或等待页面加载后重试");
   }
 
   async verify(account: Account) {
@@ -199,6 +212,63 @@ export class AccountSessionManager {
     if (state?.timer) clearTimeout(state.timer);
     this.monitors.delete(accountId);
   }
+}
+
+function routeUrl(route: "home" | "chat" | "image" | "video") {
+  if (route === "chat") return DOUBAO_CHAT;
+  if (route === "image") return DOUBAO_IMAGE;
+  if (route === "video") return DOUBAO_VIDEO;
+  return DOUBAO_HOME;
+}
+
+async function fillComposer(win: BrowserWindow, prompt: string) {
+  if (win.isDestroyed()) return false;
+  return win.webContents.executeJavaScript(`
+    (() => {
+      const selectors = [
+        '[contenteditable="true"][class*="editor"]',
+        'div[contenteditable="true"]',
+        '[contenteditable="true"]',
+        'textarea'
+      ];
+      const candidates = selectors
+        .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+        .filter(element => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return rect.width > 120 && rect.height > 20 && style.visibility !== 'hidden' && style.display !== 'none';
+        })
+        .sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          return (br.width * br.height) - (ar.width * ar.height);
+        });
+      const element = candidates[0];
+      if (!element) return false;
+      const value = ${JSON.stringify(prompt)};
+      element.focus();
+      if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+        const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+        setter?.call(element, value);
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        if (!document.execCommand('insertText', false, value)) element.textContent = value;
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      }
+      return true;
+    })()
+  `, true) as Promise<boolean>;
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function readIdentity(win: BrowserWindow) {

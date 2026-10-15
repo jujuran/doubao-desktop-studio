@@ -1,11 +1,20 @@
 import path from "node:path";
 import { writeFileSync } from "node:fs";
 import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
-import type { AppSettings, TaskRecord, TaskStatus } from "./contracts.js";
+import type {
+  AppSettings,
+  ImageTaskStatus,
+  ProjectReferenceKind,
+  ProjectStyleInput,
+  TaskInput,
+  TaskStatus,
+  UsageKind
+} from "./contracts.js";
 import { initializeDataLocation, scheduleDataMigration } from "./data-location.js";
 import { StudioDatabase } from "./database.js";
 import { DiagnosticsLogger, type DiagnosticLevel } from "./diagnostics.js";
 import { AccountSessionManager } from "./sessions.js";
+import { composeProjectPrompt } from "../src/prompt-compose.js";
 
 const appDataPath = app.getPath("appData");
 const defaultUserDataPath = app.getPath("userData");
@@ -98,25 +107,122 @@ function registerIpc() {
   });
 
   ipcMain.handle("tasks:list", () => database.listTasks());
-  ipcMain.handle("tasks:create", (_event, input: Pick<TaskRecord, "accountId" | "prompt" | "model" | "duration" | "aspectRatio">) => {
+  ipcMain.handle("tasks:create", (_event, input: TaskInput) => {
     const task = database.createTask(input);
     notifyChanged();
     return task;
   });
-  ipcMain.handle("tasks:open", (_event, id: string) => {
+  ipcMain.handle("tasks:import-many", (_event, inputs: TaskInput[]) => {
+    const tasks = database.createTasks(inputs);
+    diagnostics.info("storyboard_imported", { taskCount: tasks.length });
+    notifyChanged();
+    return tasks;
+  });
+  ipcMain.handle("tasks:update", (_event, id: string, input: TaskInput) => {
+    const task = database.updateTask(id, input);
+    notifyChanged();
+    return task;
+  });
+  ipcMain.handle("tasks:duplicate", (_event, id: string) => {
+    const task = database.duplicateTask(id);
+    notifyChanged();
+    return task;
+  });
+  ipcMain.handle("tasks:remove", (_event, id: string) => {
+    database.deleteTask(id);
+    notifyChanged();
+  });
+  ipcMain.handle("tasks:copy-prompt", (_event, id: string) => {
+    const task = database.getTask(id);
+    clipboard.writeText(composeProjectPrompt("video", task.prompt, database.getProjectStyle(task.projectName)));
+  });
+  ipcMain.handle("tasks:open-image", async (_event, id: string) => {
+    const task = database.getTask(id);
+    if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
+    if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
+    const account = database.getAccount(task.imageAccountId);
+    const finalPrompt = composeProjectPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
+    clipboard.writeText(finalPrompt);
+    database.setTaskImageStatus(id, "preparing");
+    notifyChanged();
+    await sessions.prepare(account, "image", finalPrompt);
+    return database.getTask(id);
+  });
+  ipcMain.handle("tasks:choose-image", async (event, id: string) => {
+    database.getTask(id);
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "选择已生成的分镜图",
+      buttonLabel: "使用这张图",
+      properties: ["openFile"],
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    const task = database.setTaskImage(id, result.filePaths[0]);
+    notifyChanged();
+    return task;
+  });
+  ipcMain.handle("tasks:update-image-status", (_event, id: string, status: ImageTaskStatus) => {
+    const task = database.setTaskImageStatus(id, status);
+    notifyChanged();
+    return task;
+  });
+  ipcMain.handle("tasks:auto-assign", () => {
+    const summary = database.autoAssignTasks();
+    notifyChanged();
+    return summary;
+  });
+  ipcMain.handle("tasks:open", async (_event, id: string) => {
     const task = database.getTask(id);
     if (!task.accountId) throw new Error("请先为任务选择账号");
+    if (task.imagePrompt && task.imageStatus !== "approved") throw new Error("请先完成并审核分镜图，再制作分镜视频");
     const account = database.getAccount(task.accountId);
-    clipboard.writeText(task.prompt);
-    sessions.open(account, "chat");
-    const updated = database.setTaskStatus(id, "running");
-    notifyChanged();
-    return updated;
+    const finalPrompt = composeProjectPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
+    clipboard.writeText(finalPrompt);
+    await sessions.prepare(account, "video", finalPrompt);
+    return database.getTask(id);
   });
   ipcMain.handle("tasks:update-status", (_event, id: string, status: TaskStatus) => {
     const task = database.setTaskStatus(id, status);
     notifyChanged();
     return task;
+  });
+
+  ipcMain.handle("usage:list-today", () => database.listTodayUsage());
+  ipcMain.handle("usage:adjust", (_event, accountId: string, kind: UsageKind, value: number) => {
+    const usage = database.adjustUsage(accountId, kind, value);
+    notifyChanged();
+    return usage;
+  });
+
+  ipcMain.handle("projects:list-styles", () => database.listProjectStyles());
+  ipcMain.handle("projects:save-style", (_event, input: ProjectStyleInput) => {
+    const profile = database.saveProjectStyle(input);
+    notifyChanged();
+    return profile;
+  });
+  ipcMain.handle("projects:choose-reference", async (event, kind: ProjectReferenceKind) => {
+    if (!["character", "scene", "style"].includes(kind)) throw new Error("参考图类型无效");
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const titles: Record<ProjectReferenceKind, string> = {
+      character: "选择人物定妆图",
+      scene: "选择场景参考图",
+      style: "选择风格参考图"
+    };
+    const options: Electron.OpenDialogOptions = {
+      title: titles[kind],
+      buttonLabel: "使用这张参考图",
+      properties: ["openFile"],
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    return result.canceled ? null : result.filePaths[0] ?? null;
+  });
+  ipcMain.handle("projects:apply-locks", (_event, projectName: string) => {
+    const count = database.applyProjectLocks(projectName);
+    notifyChanged();
+    return count;
   });
 
   ipcMain.handle("settings:get", () => database.getSettings());

@@ -1,14 +1,44 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import type { Account, AppSettings, RuntimeStats, TaskRecord, TaskStatus } from "../electron/contracts";
+import type {
+  Account,
+  AccountUsage,
+  AppSettings,
+  ImageTaskStatus,
+  ProjectReferenceKind,
+  ProjectStyleInput,
+  ProjectStyleProfile,
+  RuntimeStats,
+  TaskInput,
+  TaskRecord,
+  TaskStatus
+} from "../electron/contracts";
 import appIcon from "./assets/app-icon.png";
+import { parseStoryboard } from "./storyboard-import";
+import { composeProjectPrompt, hasProjectStyle } from "./prompt-compose";
+import {
+  aspectRatioLabel,
+  DEFAULT_VIDEO_MODEL,
+  durationLabel,
+  durationOptions,
+  VIDEO_MODEL_OPTIONS
+} from "./video-options";
 
 type Tab = "overview" | "accounts" | "tasks" | "settings";
 
 const activeTab = ref<Tab>("overview");
 const accounts = ref<Account[]>([]);
 const tasks = ref<TaskRecord[]>([]);
-const settings = ref<AppSettings>({ maxActiveWorkers: 2, automationEnabled: false });
+const usage = ref<AccountUsage[]>([]);
+const projectStyles = ref<ProjectStyleProfile[]>([]);
+const settings = ref<AppSettings>({
+  maxActiveWorkers: 2,
+  automationEnabled: false,
+  lastTaskAccountId: null,
+  lastVideoModel: DEFAULT_VIDEO_MODEL.value,
+  lastVideoDuration: 10,
+  lastAspectRatio: "9:16"
+});
 const runtime = ref<RuntimeStats>({
   version: "",
   totalPrivateMb: 0,
@@ -26,15 +56,86 @@ const newAccountLabel = ref("");
 const showAccountDialog = ref(false);
 const renameAccountTarget = ref<Account | null>(null);
 const renameAccountLabel = ref("");
-const taskForm = reactive({ accountId: "", prompt: "", model: "Seedance", duration: 10, aspectRatio: "9:16" });
+const editingTaskId = ref<string | null>(null);
+const showImportDialog = ref(false);
+const importText = ref("");
+const importProjectName = ref("");
+const styleTargetName = ref<string | null>(null);
+const applyStyleLocks = ref(true);
+const styleForm = reactive<ProjectStyleInput>({
+  projectName: "",
+  stylePrompt: "",
+  characterPrompt: "",
+  scenePrompt: "",
+  continuityPrompt: "",
+  negativePrompt: "",
+  characterReferencePath: null,
+  sceneReferencePath: null,
+  styleReferencePath: null,
+  lockedModel: null,
+  lockedAspectRatio: null
+});
+const taskForm = reactive({
+  projectName: "",
+  shotNumber: 1,
+  imagePrompt: "",
+  imageAccountId: "",
+  accountId: "",
+  prompt: "",
+  model: DEFAULT_VIDEO_MODEL.value,
+  duration: 10,
+  aspectRatio: "9:16"
+});
 
 const readyAccounts = computed(() => accounts.value.filter((account) => account.status === "ready"));
 const queuedTasks = computed(() => tasks.value.filter((task) => task.status === "queued").length);
 const activeTasks = computed(() => tasks.value.filter((task) => task.status === "running").length);
 const accountById = computed(() => new Map(accounts.value.map((account) => [account.id, account])));
+const usageByAccount = computed(() => new Map(usage.value.map((item) => [item.accountId, item])));
+const projectStyleByName = computed(() => new Map(projectStyles.value.map((profile) => [profile.projectName, profile])));
+const stylePreviewProfile = computed<ProjectStyleProfile>(() => ({ ...styleForm, updatedAt: "" }));
+const stylePreviewTask = computed(() => tasks.value.find((task) => task.projectName === styleForm.projectName) ?? null);
+const styleImagePreview = computed(() => composeProjectPrompt(
+  "image",
+  stylePreviewTask.value?.imagePrompt || "（当前分镜图提示词）",
+  stylePreviewProfile.value
+));
+const styleVideoPreview = computed(() => composeProjectPrompt(
+  "video",
+  stylePreviewTask.value?.prompt || "（当前分镜视频提示词）",
+  stylePreviewProfile.value
+));
+const importPreview = computed(() => {
+  if (!importText.value.trim()) return { storyboard: null, error: "" };
+  try {
+    return { storyboard: parseStoryboard(importText.value, importProjectName.value), error: "" };
+  } catch (error) {
+    return { storyboard: null, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+const selectedVideoModel = computed(
+  () => VIDEO_MODEL_OPTIONS.find((model) => model.value === taskForm.model) ?? DEFAULT_VIDEO_MODEL
+);
+const availableDurations = computed(() => durationOptions(selectedVideoModel.value));
+const availableAspectRatios = computed(() => selectedVideoModel.value.aspectRatios);
+const taskGroups = computed(() => {
+  const groups = new Map<string, TaskRecord[]>();
+  for (const task of tasks.value) {
+    const projectName = task.projectName;
+    const group = groups.get(projectName) ?? [];
+    group.push(task);
+    groups.set(projectName, group);
+  }
+  return [...groups.entries()].map(([projectName, groupTasks]) => ({
+    projectName,
+    name: projectName || "未命名项目",
+    tasks: groupTasks.sort((left, right) => left.shotNumber - right.shotNumber)
+  }));
+});
 
 let removeChangeListener: (() => void) | undefined;
 let statsTimer: number | undefined;
+let taskDefaultsLoaded = false;
 
 onMounted(async () => {
   await refresh();
@@ -57,15 +158,29 @@ async function refresh() {
 }
 
 async function refreshData() {
-  const [nextAccounts, nextTasks, nextSettings] = await Promise.all([
+  const [nextAccounts, nextTasks, nextSettings, nextUsage, nextProjectStyles] = await Promise.all([
     window.desktopApi.accounts.list(),
     window.desktopApi.tasks.list(),
-    window.desktopApi.settings.get()
+    window.desktopApi.settings.get(),
+    window.desktopApi.usage.listToday(),
+    window.desktopApi.projects.listStyles()
   ]);
   accounts.value = nextAccounts;
   tasks.value = nextTasks;
   settings.value = nextSettings;
-  if (!taskForm.accountId && readyAccounts.value[0]) taskForm.accountId = readyAccounts.value[0].id;
+  usage.value = nextUsage;
+  projectStyles.value = nextProjectStyles;
+  if (!taskDefaultsLoaded) {
+    const savedAccount = readyAccounts.value.find((account) => account.id === nextSettings.lastTaskAccountId);
+    taskForm.accountId = savedAccount?.id ?? readyAccounts.value[0]?.id ?? "";
+    taskForm.model = VIDEO_MODEL_OPTIONS.some((model) => model.value === nextSettings.lastVideoModel)
+      ? nextSettings.lastVideoModel
+      : DEFAULT_VIDEO_MODEL.value;
+    taskForm.duration = nextSettings.lastVideoDuration;
+    taskForm.aspectRatio = nextSettings.lastAspectRatio;
+    handleModelChange();
+    taskDefaultsLoaded = true;
+  }
 }
 
 async function refreshRuntime() {
@@ -119,6 +234,19 @@ async function clearAccountCache(account: Account) {
   });
 }
 
+async function calibrateUsage(account: Account) {
+  const current = accountUsage(account.id);
+  const imageValue = window.prompt(`“${account.label}”今天已生成多少张分镜图？`, String(current.imageCount));
+  if (imageValue === null) return;
+  const videoValue = window.prompt(`“${account.label}”今天已生成多少条视频？`, String(current.videoCount));
+  if (videoValue === null) return;
+  await act(async () => {
+    await window.desktopApi.usage.adjust(account.id, "image", Number(imageValue));
+    await window.desktopApi.usage.adjust(account.id, "video", Number(videoValue));
+    flash("今日用量已校准，后续自动分配会按新数字计算");
+  });
+}
+
 async function removeAccount(account: Account) {
   if (!window.confirm(`删除“${account.label}”及其本机登录状态？任务记录会保留。`)) return;
   await act(async () => {
@@ -127,24 +255,218 @@ async function removeAccount(account: Account) {
   });
 }
 
-async function createTask() {
+async function saveTask() {
   await act(async () => {
-    await window.desktopApi.tasks.create({
+    const input: TaskInput = {
+      projectName: taskForm.projectName,
+      shotNumber: Number(taskForm.shotNumber),
+      imagePrompt: taskForm.imagePrompt,
+      imageAccountId: taskForm.imageAccountId || null,
       accountId: taskForm.accountId || null,
       prompt: taskForm.prompt,
       model: taskForm.model,
       duration: Number(taskForm.duration),
       aspectRatio: taskForm.aspectRatio
+    };
+    if (editingTaskId.value) await window.desktopApi.tasks.update(editingTaskId.value, input);
+    else await window.desktopApi.tasks.create(input);
+    settings.value = await window.desktopApi.settings.update({
+      lastTaskAccountId: input.accountId,
+      lastVideoModel: input.model,
+      lastVideoDuration: input.duration,
+      lastAspectRatio: input.aspectRatio
     });
+    const wasEditing = Boolean(editingTaskId.value);
+    editingTaskId.value = null;
+    taskForm.imagePrompt = "";
     taskForm.prompt = "";
-    flash("任务已保存到本地队列");
+    if (!wasEditing) taskForm.shotNumber += 1;
+    flash(wasEditing ? "任务修改已保存" : "任务已保存，可继续填写下一分镜");
   });
+}
+
+function editTask(task: TaskRecord) {
+  editingTaskId.value = task.id;
+  taskForm.projectName = task.projectName;
+  taskForm.shotNumber = task.shotNumber;
+  taskForm.imagePrompt = task.imagePrompt;
+  taskForm.imageAccountId = task.imageAccountId ?? "";
+  taskForm.accountId = task.accountId ?? "";
+  taskForm.prompt = task.prompt;
+  taskForm.model = task.model;
+  taskForm.duration = task.duration;
+  taskForm.aspectRatio = task.aspectRatio;
+  handleModelChange();
+  document.querySelector(".task-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function cancelTaskEdit() {
+  editingTaskId.value = null;
+  taskForm.imagePrompt = "";
+  taskForm.prompt = "";
+  taskForm.projectName = "";
+  taskForm.shotNumber = 1;
+  restoreTaskDefaults();
+}
+
+function restoreTaskDefaults() {
+  const savedAccount = readyAccounts.value.find((account) => account.id === settings.value.lastTaskAccountId);
+  taskForm.imageAccountId = "";
+  taskForm.accountId = savedAccount?.id ?? readyAccounts.value[0]?.id ?? "";
+  taskForm.model = VIDEO_MODEL_OPTIONS.some((model) => model.value === settings.value.lastVideoModel)
+    ? settings.value.lastVideoModel
+    : DEFAULT_VIDEO_MODEL.value;
+  taskForm.duration = settings.value.lastVideoDuration;
+  taskForm.aspectRatio = settings.value.lastAspectRatio;
+  handleModelChange();
 }
 
 async function openTask(task: TaskRecord) {
   await act(async () => {
     await window.desktopApi.tasks.open(task.id);
-    flash("已打开对应账号，提示词也已复制到剪贴板");
+    const referenceNote = projectHasReferences(task.projectName) || task.imagePath ? "；请手动上传已保存的参考图/分镜图" : "";
+    flash(`已打开豆包视频页并自动填入合成提示词${referenceNote}，确认参数后提交`);
+  });
+}
+
+async function openImageTask(task: TaskRecord) {
+  await act(async () => {
+    await window.desktopApi.tasks.openImage(task.id);
+    const referenceNote = projectHasReferences(task.projectName) ? "；请手动上传项目参考图" : "";
+    flash(`已打开豆包生图页并自动填入合成提示词${referenceNote}，确认后提交`);
+  });
+}
+
+async function chooseTaskImage(task: TaskRecord) {
+  await act(async () => {
+    const updated = await window.desktopApi.tasks.chooseImage(task.id);
+    if (updated) flash("已关联分镜图并通过审核");
+  });
+}
+
+async function updateImageTask(task: TaskRecord, status: ImageTaskStatus) {
+  await act(async () => {
+    await window.desktopApi.tasks.updateImageStatus(task.id, status);
+    flash(status === "approved" ? "分镜图已通过审核，可以进入视频阶段" : "分镜图状态已更新");
+  });
+}
+
+async function autoAssignTasks() {
+  await act(async () => {
+    const summary = await window.desktopApi.tasks.autoAssign();
+    flash(`已分配 ${summary.imageAssignments} 个生图任务、${summary.videoAssignments} 个视频任务`);
+  });
+}
+
+async function importStoryboardTasks() {
+  const parsed = importPreview.value.storyboard;
+  if (!parsed) return;
+  await act(async () => {
+    const inputs: TaskInput[] = parsed.shots.map((shot) => ({
+      projectName: parsed.projectName,
+      shotNumber: shot.shotNumber,
+      imagePrompt: shot.imagePrompt,
+      imageAccountId: null,
+      accountId: null,
+      prompt: shot.videoPrompt,
+      model: shot.model,
+      duration: shot.duration,
+      aspectRatio: shot.aspectRatio
+    }));
+    await window.desktopApi.tasks.importMany(inputs);
+    let assignmentMessage = "";
+    try {
+      const summary = await window.desktopApi.tasks.autoAssign();
+      assignmentMessage = `，并分配 ${summary.imageAssignments} 个生图、${summary.videoAssignments} 个视频任务`;
+    } catch {
+      assignmentMessage = "；登录并确认账号后可使用自动分配";
+    }
+    showImportDialog.value = false;
+    importText.value = "";
+    importProjectName.value = "";
+    flash(`已导入 ${inputs.length} 个分镜${assignmentMessage}`);
+  });
+}
+
+function openProjectStyle(projectName: string) {
+  if (!projectName) {
+    flash("请先给项目填写名称，再设置风格锁定", true);
+    return;
+  }
+  const existing = projectStyleByName.value.get(projectName);
+  Object.assign(styleForm, existing ? {
+    projectName: existing.projectName,
+    stylePrompt: existing.stylePrompt,
+    characterPrompt: existing.characterPrompt,
+    scenePrompt: existing.scenePrompt,
+    continuityPrompt: existing.continuityPrompt,
+    negativePrompt: existing.negativePrompt,
+    characterReferencePath: existing.characterReferencePath,
+    sceneReferencePath: existing.sceneReferencePath,
+    styleReferencePath: existing.styleReferencePath,
+    lockedModel: existing.lockedModel,
+    lockedAspectRatio: existing.lockedAspectRatio
+  } : {
+    projectName,
+    stylePrompt: "",
+    characterPrompt: "",
+    scenePrompt: "",
+    continuityPrompt: "保持人物身份、服装、场景布局、时间、光线方向和色彩分级与相邻分镜一致。",
+    negativePrompt: "禁止人物变形、换脸、换装、场景突变、色彩跳变、镜头抖动、多余人物、文字和水印。",
+    characterReferencePath: null,
+    sceneReferencePath: null,
+    styleReferencePath: null,
+    lockedModel: null,
+    lockedAspectRatio: null
+  });
+  applyStyleLocks.value = true;
+  styleTargetName.value = projectName;
+}
+
+async function chooseProjectReference(kind: ProjectReferenceKind) {
+  const selected = await window.desktopApi.projects.chooseReference(kind);
+  if (!selected) return;
+  if (kind === "character") styleForm.characterReferencePath = selected;
+  if (kind === "scene") styleForm.sceneReferencePath = selected;
+  if (kind === "style") styleForm.styleReferencePath = selected;
+}
+
+function clearProjectReference(kind: ProjectReferenceKind) {
+  if (kind === "character") styleForm.characterReferencePath = null;
+  if (kind === "scene") styleForm.sceneReferencePath = null;
+  if (kind === "style") styleForm.styleReferencePath = null;
+}
+
+async function saveProjectStyle() {
+  await act(async () => {
+    await window.desktopApi.projects.saveStyle({ ...styleForm });
+    let affected = 0;
+    if (applyStyleLocks.value) affected = await window.desktopApi.projects.applyLocks(styleForm.projectName);
+    styleTargetName.value = null;
+    flash(`项目风格锁定已保存${applyStyleLocks.value ? `，已统一 ${affected} 个分镜的模型与画幅` : ""}`);
+  });
+}
+
+async function copyTaskPrompt(task: TaskRecord) {
+  await act(async () => {
+    await window.desktopApi.tasks.copyPrompt(task.id);
+    flash("提示词已复制");
+  });
+}
+
+async function duplicateTask(task: TaskRecord) {
+  await act(async () => {
+    const duplicated = await window.desktopApi.tasks.duplicate(task.id);
+    flash(`已复制为分镜 ${duplicated.shotNumber}`);
+  });
+}
+
+async function removeTask(task: TaskRecord) {
+  if (!window.confirm(`删除“${task.projectName || "未命名项目"}”的分镜 ${task.shotNumber}？`)) return;
+  await act(async () => {
+    await window.desktopApi.tasks.remove(task.id);
+    if (editingTaskId.value === task.id) cancelTaskEdit();
+    flash("任务已删除");
   });
 }
 
@@ -210,12 +532,44 @@ function statusLabel(status: string) {
     ready: "可用",
     busy: "执行中",
     error: "异常",
-    queued: "已排队",
+    queued: "待提交",
+    submitted: "已提交",
     running: "执行中",
     succeeded: "已完成",
     failed: "失败",
     cancelled: "已取消"
   } as Record<string, string>)[status] || status;
+}
+
+function imageStatusLabel(status: ImageTaskStatus) {
+  return ({
+    pending: "待生图",
+    preparing: "待提交",
+    submitted: "已提交",
+    ready: "待审核",
+    approved: "已通过",
+    failed: "失败",
+    skipped: "无需生图"
+  } as Record<ImageTaskStatus, string>)[status];
+}
+
+function accountUsage(accountId: string) {
+  return usageByAccount.value.get(accountId) ?? { accountId, usageDate: "", imageCount: 0, videoCount: 0 };
+}
+
+function fileName(value: string | null) {
+  return value ? value.split(/[\\/]/).at(-1) || value : "";
+}
+
+function projectHasReferences(projectName: string) {
+  const profile = projectStyleByName.value.get(projectName);
+  return Boolean(profile?.characterReferencePath || profile?.sceneReferencePath || profile?.styleReferencePath);
+}
+
+function taskGroupSummary(groupTasks: TaskRecord[]) {
+  const fixedDuration = groupTasks.reduce((sum, task) => sum + (task.duration > 0 ? task.duration : 0), 0);
+  const adaptive = groupTasks.some((task) => task.duration === -1);
+  return `${groupTasks.length} 个分镜 · ${fixedDuration} 秒${adaptive ? " + 自动时长" : ""}`;
 }
 
 function accountStatusLabel(account: Account) {
@@ -234,6 +588,14 @@ function shortId(value: string | null) {
 
 function formatTime(value: string) {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+}
+
+function handleModelChange() {
+  if (!VIDEO_MODEL_OPTIONS.some((model) => model.value === taskForm.model)) {
+    taskForm.model = DEFAULT_VIDEO_MODEL.value;
+  }
+  if (!availableDurations.value.includes(taskForm.duration)) taskForm.duration = 10;
+  if (!availableAspectRatios.value.includes(taskForm.aspectRatio)) taskForm.aspectRatio = "9:16";
 }
 </script>
 
@@ -310,11 +672,13 @@ function formatTime(value: string) {
             <div class="account-head"><div class="avatar">{{ account.label.slice(0, 1) }}</div><span class="badge" :class="account.status">{{ accountStatusLabel(account) }}</span></div>
             <h3>{{ account.label }}</h3><p>{{ account.displayName || '打开窗口并登录后进行确认' }}</p><code>{{ shortId(account.doubaoUserId) }}</code>
             <small v-if="account.lastVerifiedAt">上次确认：{{ formatTime(account.lastVerifiedAt) }}</small>
+            <small>今日记录：生图 {{ accountUsage(account.id).imageCount }} · 视频 {{ accountUsage(account.id).videoCount }}</small>
             <small v-if="isAccountWindowOpen(account.id)" class="window-open"><span class="live-dot"></span>窗口已打开</small>
             <div class="card-actions">
               <button class="primary small" @click="openAccount(account)">打开</button>
               <button @click="verifyAccount(account)">确认账号</button>
               <button @click="openRenameAccount(account)">改备注</button>
+              <button @click="calibrateUsage(account)">校准用量</button>
               <button @click="clearAccountCache(account)">清缓存</button>
               <button class="danger" @click="removeAccount(account)">删除</button>
             </div>
@@ -324,31 +688,106 @@ function formatTime(value: string) {
       </template>
 
       <template v-else-if="activeTab === 'tasks'">
+        <section class="task-toolbar">
+          <div><p class="eyebrow">STORYBOARD PIPELINE</p><h2>分镜图审核后再进入视频生成</h2></div>
+          <div><button @click="showImportDialog = true">批量导入分镜</button><button class="primary" @click="autoAssignTasks">自动分配账号</button></div>
+        </section>
         <section class="task-layout">
-          <form class="panel task-form" @submit.prevent="createTask">
-            <p class="eyebrow">NEW TASK</p><h2>保存视频任务</h2>
-            <label>执行账号<select v-model="taskForm.accountId"><option value="">暂不指定</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
-            <label>提示词<textarea v-model="taskForm.prompt" rows="7" placeholder="描述画面、镜头、运动、风格和声音…" required></textarea></label>
-            <div class="form-row"><label>模型<input v-model="taskForm.model" /></label><label>时长<select v-model.number="taskForm.duration"><option :value="5">5 秒</option><option :value="10">10 秒</option></select></label><label>画幅<select v-model="taskForm.aspectRatio"><option>9:16</option><option>16:9</option><option>1:1</option></select></label></div>
-            <button class="primary wide" type="submit">保存到任务队列</button>
-            <p class="form-note">当前版本采用辅助执行：打开对应账号并自动复制提示词。自动提交适配器将在账号隔离验证稳定后接入。</p>
+          <form class="panel task-form" @submit.prevent="saveTask">
+            <p class="eyebrow">{{ editingTaskId ? 'EDIT SHOT' : 'NEW SHOT' }}</p><h2>{{ editingTaskId ? '编辑分镜任务' : '保存单个分镜' }}</h2>
+            <div class="project-row">
+              <label>项目 / 视频名称<input v-model="taskForm.projectName" maxlength="80" placeholder="例如：产品宣传片" /></label>
+              <label>分镜编号<input v-model.number="taskForm.shotNumber" type="number" min="1" step="1" required /></label>
+            </div>
+            <button class="inline-style-button" type="button" :disabled="!taskForm.projectName.trim()" @click="openProjectStyle(taskForm.projectName)">设置当前项目风格锁定</button>
+            <div class="stage-block image-stage">
+              <div class="stage-title"><span>1</span><strong>分镜图</strong><small>可留空，留空时直接进入视频阶段</small></div>
+              <label>生图账号<select v-model="taskForm.imageAccountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
+              <label>分镜图提示词<textarea v-model="taskForm.imagePrompt" rows="4" placeholder="描述主体、场景、构图、光线和画面风格…"></textarea></label>
+            </div>
+            <div class="stage-block video-stage">
+              <div class="stage-title"><span>2</span><strong>分镜视频</strong><small>有分镜图时，需审核通过后执行</small></div>
+              <label>视频账号<select v-model="taskForm.accountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
+              <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
+            </div>
+            <div class="form-row">
+              <label class="model-field">模型
+                <select v-model="taskForm.model" @change="handleModelChange">
+                  <option v-for="model in VIDEO_MODEL_OPTIONS" :key="model.value" :value="model.value">{{ model.label }}</option>
+                </select>
+              </label>
+              <label>时长
+                <select v-model.number="taskForm.duration">
+                  <option v-for="duration in availableDurations" :key="duration" :value="duration">{{ durationLabel(duration) }}</option>
+                </select>
+              </label>
+              <label>画幅
+                <select v-model="taskForm.aspectRatio">
+                  <option v-for="aspectRatio in availableAspectRatios" :key="aspectRatio" :value="aspectRatio">{{ aspectRatioLabel(aspectRatio) }}</option>
+                </select>
+              </label>
+            </div>
+            <p class="spec-note">{{ selectedVideoModel.label }} · {{ selectedVideoModel.durationMin }}–{{ selectedVideoModel.durationMax }} 秒 · 支持自动时长与自适应画幅</p>
+            <div class="form-actions">
+              <button v-if="editingTaskId" type="button" @click="cancelTaskEdit">取消编辑</button>
+              <button class="primary" :class="{ wide: !editingTaskId }" type="submit">{{ editingTaskId ? '保存修改' : '保存并继续下一分镜' }}</button>
+            </div>
+            <p class="form-note">点击执行后会打开对应隔离账号并自动填入提示词。模型、时长、画幅、提交按钮以及生成结果目前仍由你在豆包页面确认。</p>
           </form>
 
           <section class="panel task-list">
-            <div class="section-heading"><div><p class="eyebrow">LOCAL QUEUE</p><h2>任务记录</h2></div><span>{{ tasks.length }} 条</span></div>
-            <div v-if="tasks.length" class="task-items">
-              <article v-for="task in tasks" :key="task.id" class="task-item">
-                <div><span class="badge" :class="task.status">{{ statusLabel(task.status) }}</span><small>{{ accountName(task.accountId) }} · {{ task.duration }}s · {{ task.aspectRatio }}</small></div>
-                <p>{{ task.prompt }}</p>
-                <div class="task-meta"><span>{{ task.model }}</span><span>{{ formatTime(task.createdAt) }}</span></div>
-                <div class="card-actions">
-                  <button v-if="task.status === 'queued' || task.status === 'failed'" class="primary small" @click="openTask(task)">打开执行</button>
-                  <button v-if="task.status === 'running'" @click="updateTask(task, 'succeeded')">标记完成</button>
-                  <button v-if="task.status !== 'succeeded' && task.status !== 'cancelled'" @click="updateTask(task, 'cancelled')">取消</button>
+            <div class="section-heading"><div><p class="eyebrow">LOCAL QUEUE</p><h2>分镜流水线</h2></div><span>{{ tasks.length }} 条</span></div>
+            <div v-if="tasks.length" class="task-groups">
+              <section v-for="group in taskGroups" :key="group.name" class="task-group">
+                <div class="task-group-head">
+                  <div><strong>{{ group.name }}</strong><span>{{ taskGroupSummary(group.tasks) }}</span></div>
+                  <button v-if="group.projectName" class="style-lock-button" :class="{ active: hasProjectStyle(projectStyleByName.get(group.projectName)) }" @click="openProjectStyle(group.projectName)">
+                    {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已锁定风格' : '设置风格锁定' }}
+                  </button>
+                  <button v-else class="style-lock-button" disabled>命名后可锁定风格</button>
                 </div>
-              </article>
+                <div class="task-items">
+                  <article v-for="task in group.tasks" :key="task.id" class="task-item">
+                    <div><strong>分镜 {{ task.shotNumber }}</strong><small>{{ durationLabel(task.duration) }} · {{ aspectRatioLabel(task.aspectRatio) }}</small></div>
+                    <div class="pipeline-row">
+                      <div class="pipeline-step" :class="{ done: task.imageStatus === 'approved' || task.imageStatus === 'skipped' }">
+                        <span class="badge" :class="task.imageStatus">{{ imageStatusLabel(task.imageStatus) }}</span>
+                        <strong>分镜图</strong><small>{{ accountName(task.imageAccountId) }}</small>
+                      </div>
+                      <b>→</b>
+                      <div class="pipeline-step" :class="{ locked: !!task.imagePrompt && task.imageStatus !== 'approved' }">
+                        <span class="badge" :class="task.status">{{ statusLabel(task.status) }}</span>
+                        <strong>分镜视频</strong><small>{{ accountName(task.accountId) }}</small>
+                      </div>
+                    </div>
+                    <details v-if="task.imagePrompt" class="prompt-detail"><summary>分镜图提示词</summary><p>{{ task.imagePrompt }}</p></details>
+                    <details class="prompt-detail"><summary>分镜视频提示词</summary><p>{{ task.prompt }}</p></details>
+                    <p v-if="task.imagePath" class="image-path">已关联：{{ fileName(task.imagePath) }}</p>
+                    <div class="task-meta"><span>{{ task.model }}<template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))"> · 项目风格已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
+                    <div v-if="task.imagePrompt" class="card-actions stage-actions">
+                      <button class="primary small" @click="openImageTask(task)">打开生图页</button>
+                      <button v-if="task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending'" @click="updateImageTask(task, 'submitted')">标记已提交</button>
+                      <button v-if="task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
+                      <button @click="chooseTaskImage(task)">选择本地分镜图</button>
+                      <button v-if="task.imageStatus !== 'approved'" @click="updateImageTask(task, 'approved')">通过审核</button>
+                      <button v-if="task.imageStatus !== 'failed'" @click="updateImageTask(task, 'failed')">生图失败</button>
+                    </div>
+                    <div class="card-actions stage-actions">
+                      <button class="primary small" :disabled="!!task.imagePrompt && task.imageStatus !== 'approved'" @click="openTask(task)">打开视频页</button>
+                      <button @click="copyTaskPrompt(task)">复制视频提示词</button>
+                      <button @click="editTask(task)">编辑</button>
+                      <button @click="duplicateTask(task)">复制为下一镜</button>
+                      <button v-if="task.status === 'queued' || task.status === 'failed' || task.status === 'cancelled'" @click="updateTask(task, 'submitted')">标记已提交</button>
+                      <button v-if="task.status === 'submitted'" @click="updateTask(task, 'running')">标记生成中</button>
+                      <button v-if="task.status === 'submitted' || task.status === 'running'" @click="updateTask(task, 'succeeded')">标记完成</button>
+                      <button v-if="task.status === 'submitted' || task.status === 'running'" @click="updateTask(task, 'failed')">标记失败</button>
+                      <button class="danger" @click="removeTask(task)">删除</button>
+                    </div>
+                  </article>
+                </div>
+              </section>
             </div>
-            <div v-else class="empty inline"><strong>还没有任务</strong><span>先在左侧保存一个视频任务。</span></div>
+            <div v-else class="empty inline"><strong>还没有任务</strong><span>可以保存单个分镜，也可以一次导入整套分镜。</span></div>
           </section>
         </section>
       </template>
@@ -368,6 +807,57 @@ function formatTime(value: string) {
     </div>
     <div v-if="renameAccountTarget" class="modal-backdrop" @click.self="renameAccountTarget = null">
       <form class="modal" @submit.prevent="renameAccount"><p class="eyebrow">LOCAL LABEL</p><h2>修改账号备注</h2><p class="muted">只修改工作台里的本地备注，不会修改豆包昵称。</p><label>本地备注<input v-model="renameAccountLabel" autofocus maxlength="60" required /></label><div class="modal-actions"><button type="button" @click="renameAccountTarget = null">取消</button><button class="primary" type="submit">保存备注</button></div></form>
+    </div>
+    <div v-if="showImportDialog" class="modal-backdrop" @click.self="showImportDialog = false">
+      <form class="modal import-modal" @submit.prevent="importStoryboardTasks">
+        <p class="eyebrow">BATCH STORYBOARD</p><h2>批量导入整套分镜</h2>
+        <p class="muted">支持 JSON，或“分镜 1 / 分镜图提示词 / 视频提示词 / 时长 / 画幅”Markdown 格式。导入后会自动均衡分配可用账号。</p>
+        <label>项目名称（原文中有项目名称时可留空）<input v-model="importProjectName" placeholder="例如：柯基水草球短片" /></label>
+        <label>分镜内容<textarea v-model="importText" rows="15" placeholder="### 分镜 1&#10;分镜图提示词：……&#10;视频提示词：……&#10;时长：10秒&#10;画幅：9:16"></textarea></label>
+        <div v-if="importPreview.storyboard" class="import-result success">识别到 {{ importPreview.storyboard.shots.length }} 个分镜 · 项目：{{ importPreview.storyboard.projectName }}</div>
+        <div v-else-if="importPreview.error" class="import-result error">{{ importPreview.error }}</div>
+        <div class="modal-actions"><button type="button" @click="showImportDialog = false">取消</button><button class="primary" type="submit" :disabled="!importPreview.storyboard">导入并自动分配</button></div>
+      </form>
+    </div>
+    <div v-if="styleTargetName" class="modal-backdrop" @click.self="styleTargetName = null">
+      <form class="modal style-modal" @submit.prevent="saveProjectStyle">
+        <p class="eyebrow">PROJECT STYLE LOCK</p><h2>{{ styleForm.projectName }} · 风格锁定</h2>
+        <p class="muted">这些内容会自动合成到本项目每条生图和视频提示词。三个参考图会保存在本机；现阶段打开豆包后仍需手动上传需要使用的参考图。</p>
+
+        <div class="reference-grid">
+          <article>
+            <strong>人物定妆图</strong><span>{{ fileName(styleForm.characterReferencePath) || '未选择' }}</span>
+            <div><button type="button" @click="chooseProjectReference('character')">选择</button><button v-if="styleForm.characterReferencePath" type="button" @click="clearProjectReference('character')">清除</button></div>
+          </article>
+          <article>
+            <strong>场景参考图</strong><span>{{ fileName(styleForm.sceneReferencePath) || '未选择' }}</span>
+            <div><button type="button" @click="chooseProjectReference('scene')">选择</button><button v-if="styleForm.sceneReferencePath" type="button" @click="clearProjectReference('scene')">清除</button></div>
+          </article>
+          <article>
+            <strong>风格参考图</strong><span>{{ fileName(styleForm.styleReferencePath) || '未选择' }}</span>
+            <div><button type="button" @click="chooseProjectReference('style')">选择</button><button v-if="styleForm.styleReferencePath" type="button" @click="clearProjectReference('style')">清除</button></div>
+          </article>
+        </div>
+
+        <div class="style-fields">
+          <label>项目固定风格<textarea v-model="styleForm.stylePrompt" rows="3" placeholder="例如：写实电影动画，低饱和暖色，自然光，35mm镜头，柔和景深…"></textarea></label>
+          <label>固定人物约束<textarea v-model="styleForm.characterPrompt" rows="3" placeholder="例如：保持人物脸型、发型、服装、年龄和体型一致…"></textarea></label>
+          <label>固定场景约束<textarea v-model="styleForm.scenePrompt" rows="3" placeholder="例如：保持住宅结构、家具位置、时间与主光方向一致…"></textarea></label>
+          <label>连续性约束<textarea v-model="styleForm.continuityPrompt" rows="3"></textarea></label>
+          <label>禁止项<textarea v-model="styleForm.negativePrompt" rows="3"></textarea></label>
+        </div>
+
+        <div class="lock-row">
+          <label>锁定视频模型<select v-model="styleForm.lockedModel"><option :value="null">不锁定</option><option v-for="model in VIDEO_MODEL_OPTIONS" :key="model.value" :value="model.value">{{ model.label }}</option></select></label>
+          <label>锁定画幅<select v-model="styleForm.lockedAspectRatio"><option :value="null">不锁定</option><option v-for="ratio in ['adaptive', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16']" :key="ratio" :value="ratio">{{ aspectRatioLabel(ratio) }}</option></select></label>
+        </div>
+        <label class="checkbox-row"><input v-model="applyStyleLocks" type="checkbox" />立即把锁定的模型和画幅应用到本项目现有分镜</label>
+
+        <details class="prompt-preview"><summary>查看合成后的分镜图提示词</summary><pre>{{ styleImagePreview }}</pre></details>
+        <details class="prompt-preview"><summary>查看合成后的分镜视频提示词</summary><pre>{{ styleVideoPreview }}</pre></details>
+
+        <div class="modal-actions"><button type="button" @click="styleTargetName = null">取消</button><button class="primary" type="submit">保存项目风格</button></div>
+      </form>
     </div>
   </div>
 </template>
