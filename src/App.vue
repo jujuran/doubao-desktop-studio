@@ -3,7 +3,9 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import type {
   Account,
   AccountUsage,
+  AssetFolderSelection,
   AppSettings,
+  FirstFrameSource,
   ImageTaskStatus,
   ProjectReferenceKind,
   ProjectStyleInput,
@@ -15,6 +17,7 @@ import type {
 } from "../electron/contracts";
 import appIcon from "./assets/app-icon.png";
 import { parseStoryboard } from "./storyboard-import";
+import { resolveStoryboardAssets } from "./storyboard-assets";
 import { composeProjectPrompt, hasProjectStyle } from "./prompt-compose";
 import {
   aspectRatioLabel,
@@ -60,15 +63,16 @@ const editingTaskId = ref<string | null>(null);
 const showImportDialog = ref(false);
 const importText = ref("");
 const importProjectName = ref("");
+const importAssets = ref<AssetFolderSelection>({ cancelled: false, folderPath: null, files: [] });
+const importGlobalChoice = ref<"incoming" | "existing">("incoming");
 const styleTargetName = ref<string | null>(null);
 const applyStyleLocks = ref(true);
 const styleForm = reactive<ProjectStyleInput>({
   projectName: "",
-  stylePrompt: "",
-  characterPrompt: "",
-  scenePrompt: "",
-  continuityPrompt: "",
-  negativePrompt: "",
+  globalPrompt: "",
+  imageGlobalPrompt: "",
+  videoGlobalPrompt: "",
+  migrationPending: false,
   characterReferencePath: null,
   sceneReferencePath: null,
   styleReferencePath: null,
@@ -78,6 +82,7 @@ const styleForm = reactive<ProjectStyleInput>({
 const taskForm = reactive({
   projectName: "",
   shotNumber: 1,
+  firstFrameSource: "none" as FirstFrameSource,
   imagePrompt: "",
   imageAccountId: "",
   accountId: "",
@@ -113,6 +118,20 @@ const importPreview = computed(() => {
     return { storyboard: null, error: error instanceof Error ? error.message : String(error) };
   }
 });
+const importAssetResolution = computed(() => importPreview.value.storyboard
+  ? resolveStoryboardAssets(importPreview.value.storyboard.shots, importAssets.value.files)
+  : null
+);
+const importGlobalConflict = computed(() => {
+  const storyboard = importPreview.value.storyboard;
+  if (!storyboard) return false;
+  const existing = projectStyleByName.value.get(storyboard.projectName);
+  if (!existing) return false;
+  const incoming = [storyboard.globalPrompt, storyboard.imageGlobalPrompt, storyboard.videoGlobalPrompt].join("\n").trim();
+  const saved = [existing.globalPrompt, existing.imageGlobalPrompt, existing.videoGlobalPrompt].join("\n").trim();
+  return Boolean(incoming && incoming !== saved);
+});
+const canImportStoryboard = computed(() => Boolean(importPreview.value.storyboard && !importAssetResolution.value?.hasErrors));
 const selectedVideoModel = computed(
   () => VIDEO_MODEL_OPTIONS.find((model) => model.value === taskForm.model) ?? DEFAULT_VIDEO_MODEL
 );
@@ -260,6 +279,10 @@ async function saveTask() {
     const input: TaskInput = {
       projectName: taskForm.projectName,
       shotNumber: Number(taskForm.shotNumber),
+      firstFrameSource: taskForm.firstFrameSource,
+      firstFrameFileName: editingTaskId.value && taskForm.firstFrameSource !== "none"
+        ? tasks.value.find((task) => task.id === editingTaskId.value)?.firstFrameFileName ?? null
+        : null,
       imagePrompt: taskForm.imagePrompt,
       imageAccountId: taskForm.imageAccountId || null,
       accountId: taskForm.accountId || null,
@@ -289,6 +312,7 @@ function editTask(task: TaskRecord) {
   editingTaskId.value = task.id;
   taskForm.projectName = task.projectName;
   taskForm.shotNumber = task.shotNumber;
+  taskForm.firstFrameSource = task.firstFrameSource;
   taskForm.imagePrompt = task.imagePrompt;
   taskForm.imageAccountId = task.imageAccountId ?? "";
   taskForm.accountId = task.accountId ?? "";
@@ -303,6 +327,7 @@ function editTask(task: TaskRecord) {
 function cancelTaskEdit() {
   editingTaskId.value = null;
   taskForm.imagePrompt = "";
+  taskForm.firstFrameSource = "none";
   taskForm.prompt = "";
   taskForm.projectName = "";
   taskForm.shotNumber = 1;
@@ -324,8 +349,9 @@ function restoreTaskDefaults() {
 async function openTask(task: TaskRecord) {
   await act(async () => {
     await window.desktopApi.tasks.open(task.id);
-    const referenceNote = projectHasReferences(task.projectName) || task.imagePath ? "；请手动上传已保存的参考图/分镜图" : "";
-    flash(`已打开豆包视频页并自动填入合成提示词${referenceNote}，确认参数后提交`);
+    const frameNote = task.firstFrameSource === "none" ? "" : "，已自动上传锁定首帧";
+    const referenceNote = projectHasReferences(task.projectName) ? "；项目参考图目前仍需手动上传" : "";
+    flash(`已打开豆包视频页并自动填入合成提示词${frameNote}${referenceNote}，确认参数后提交`);
   });
 }
 
@@ -365,6 +391,9 @@ async function importStoryboardTasks() {
     const inputs: TaskInput[] = parsed.shots.map((shot) => ({
       projectName: parsed.projectName,
       shotNumber: shot.shotNumber,
+      firstFrameSource: shot.firstFrameSource,
+      firstFrameFileName: shot.firstFrameImage || importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file?.name || null,
+      sourceImagePath: importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file?.path || null,
       imagePrompt: shot.imagePrompt,
       imageAccountId: null,
       accountId: null,
@@ -373,6 +402,22 @@ async function importStoryboardTasks() {
       duration: shot.duration,
       aspectRatio: shot.aspectRatio
     }));
+    const incomingHasGlobals = Boolean(parsed.globalPrompt || parsed.imageGlobalPrompt || parsed.videoGlobalPrompt);
+    const existing = projectStyleByName.value.get(parsed.projectName);
+    if (incomingHasGlobals && (!existing || importGlobalChoice.value === "incoming")) {
+      await window.desktopApi.projects.saveStyle({
+        projectName: parsed.projectName,
+        globalPrompt: parsed.globalPrompt,
+        imageGlobalPrompt: parsed.imageGlobalPrompt,
+        videoGlobalPrompt: parsed.videoGlobalPrompt,
+        migrationPending: false,
+        characterReferencePath: existing?.characterReferencePath ?? null,
+        sceneReferencePath: existing?.sceneReferencePath ?? null,
+        styleReferencePath: existing?.styleReferencePath ?? null,
+        lockedModel: existing?.lockedModel ?? null,
+        lockedAspectRatio: existing?.lockedAspectRatio ?? null
+      });
+    }
     await window.desktopApi.tasks.importMany(inputs);
     let assignmentMessage = "";
     try {
@@ -384,6 +429,7 @@ async function importStoryboardTasks() {
     showImportDialog.value = false;
     importText.value = "";
     importProjectName.value = "";
+    importAssets.value = { cancelled: false, folderPath: null, files: [] };
     flash(`已导入 ${inputs.length} 个分镜${assignmentMessage}`);
   });
 }
@@ -396,11 +442,10 @@ function openProjectStyle(projectName: string) {
   const existing = projectStyleByName.value.get(projectName);
   Object.assign(styleForm, existing ? {
     projectName: existing.projectName,
-    stylePrompt: existing.stylePrompt,
-    characterPrompt: existing.characterPrompt,
-    scenePrompt: existing.scenePrompt,
-    continuityPrompt: existing.continuityPrompt,
-    negativePrompt: existing.negativePrompt,
+    globalPrompt: existing.globalPrompt,
+    imageGlobalPrompt: existing.imageGlobalPrompt,
+    videoGlobalPrompt: existing.videoGlobalPrompt,
+    migrationPending: existing.migrationPending,
     characterReferencePath: existing.characterReferencePath,
     sceneReferencePath: existing.sceneReferencePath,
     styleReferencePath: existing.styleReferencePath,
@@ -408,11 +453,10 @@ function openProjectStyle(projectName: string) {
     lockedAspectRatio: existing.lockedAspectRatio
   } : {
     projectName,
-    stylePrompt: "",
-    characterPrompt: "",
-    scenePrompt: "",
-    continuityPrompt: "保持人物身份、服装、场景布局、时间、光线方向和色彩分级与相邻分镜一致。",
-    negativePrompt: "禁止人物变形、换脸、换装、场景突变、色彩跳变、镜头抖动、多余人物、文字和水印。",
+    globalPrompt: "吉卜力风格宠物动画，保持角色外形、花纹、配饰、场景布局、光线方向和色彩统一。",
+    imageGlobalPrompt: "",
+    videoGlobalPrompt: "保持首帧造型与画风，动作自然连贯。禁止角色变形、花纹改变、多余肢体、文字和水印。",
+    migrationPending: false,
     characterReferencePath: null,
     sceneReferencePath: null,
     styleReferencePath: null,
@@ -439,11 +483,18 @@ function clearProjectReference(kind: ProjectReferenceKind) {
 
 async function saveProjectStyle() {
   await act(async () => {
-    await window.desktopApi.projects.saveStyle({ ...styleForm });
+    await window.desktopApi.projects.saveStyle({ ...styleForm, migrationPending: false });
     let affected = 0;
     if (applyStyleLocks.value) affected = await window.desktopApi.projects.applyLocks(styleForm.projectName);
     styleTargetName.value = null;
     flash(`项目风格锁定已保存${applyStyleLocks.value ? `，已统一 ${affected} 个分镜的模型与画幅` : ""}`);
+  });
+}
+
+async function chooseImportAssetFolder() {
+  await act(async () => {
+    const selected = await window.desktopApi.imports.chooseAssetFolder();
+    if (!selected.cancelled) importAssets.value = selected;
   });
 }
 
@@ -597,6 +648,13 @@ function handleModelChange() {
   if (!availableDurations.value.includes(taskForm.duration)) taskForm.duration = 10;
   if (!availableAspectRatios.value.includes(taskForm.aspectRatio)) taskForm.aspectRatio = "9:16";
 }
+
+function handleFirstFrameSourceChange() {
+  if (taskForm.firstFrameSource !== "generated") {
+    taskForm.imagePrompt = "";
+    taskForm.imageAccountId = "";
+  }
+}
 </script>
 
 <template>
@@ -699,11 +757,19 @@ function handleModelChange() {
               <label>项目 / 视频名称<input v-model="taskForm.projectName" maxlength="80" placeholder="例如：产品宣传片" /></label>
               <label>分镜编号<input v-model.number="taskForm.shotNumber" type="number" min="1" step="1" required /></label>
             </div>
-            <button class="inline-style-button" type="button" :disabled="!taskForm.projectName.trim()" @click="openProjectStyle(taskForm.projectName)">设置当前项目风格锁定</button>
+            <button class="inline-style-button" type="button" :disabled="!taskForm.projectName.trim()" @click="openProjectStyle(taskForm.projectName)">设置项目全局约束</button>
             <div class="stage-block image-stage">
-              <div class="stage-title"><span>1</span><strong>分镜图</strong><small>可留空，留空时直接进入视频阶段</small></div>
-              <label>生图账号<select v-model="taskForm.imageAccountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
-              <label>分镜图提示词<textarea v-model="taskForm.imagePrompt" rows="4" placeholder="描述主体、场景、构图、光线和画面风格…"></textarea></label>
+              <div class="stage-title"><span>1</span><strong>首帧来源</strong><small>三种方式任选一种</small></div>
+              <div class="source-options">
+                <label><input v-model="taskForm.firstFrameSource" type="radio" value="local" @change="handleFirstFrameSourceChange" />本地图片</label>
+                <label><input v-model="taskForm.firstFrameSource" type="radio" value="generated" @change="handleFirstFrameSourceChange" />提示词生成</label>
+                <label><input v-model="taskForm.firstFrameSource" type="radio" value="none" @change="handleFirstFrameSourceChange" />无（纯文生视频）</label>
+              </div>
+              <template v-if="taskForm.firstFrameSource === 'generated'">
+                <label>生图账号<select v-model="taskForm.imageAccountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
+                <label>分镜图提示词<textarea v-model="taskForm.imagePrompt" rows="4" placeholder="描述主体、场景、构图、光线和画面风格…" required></textarea></label>
+              </template>
+              <p v-else-if="taskForm.firstFrameSource === 'local'" class="form-note">保存后在分镜卡片中选择本地图片；批量导入可按文件名自动匹配。</p>
             </div>
             <div class="stage-block video-stage">
               <div class="stage-title"><span>2</span><strong>分镜视频</strong><small>有分镜图时，需审核通过后执行</small></div>
@@ -742,7 +808,7 @@ function handleModelChange() {
                 <div class="task-group-head">
                   <div><strong>{{ group.name }}</strong><span>{{ taskGroupSummary(group.tasks) }}</span></div>
                   <button v-if="group.projectName" class="style-lock-button" :class="{ active: hasProjectStyle(projectStyleByName.get(group.projectName)) }" @click="openProjectStyle(group.projectName)">
-                    {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已锁定风格' : '设置风格锁定' }}
+                    {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已设全局约束' : '设置全局约束' }}
                   </button>
                   <button v-else class="style-lock-button" disabled>命名后可锁定风格</button>
                 </div>
@@ -752,10 +818,10 @@ function handleModelChange() {
                     <div class="pipeline-row">
                       <div class="pipeline-step" :class="{ done: task.imageStatus === 'approved' || task.imageStatus === 'skipped' }">
                         <span class="badge" :class="task.imageStatus">{{ imageStatusLabel(task.imageStatus) }}</span>
-                        <strong>分镜图</strong><small>{{ accountName(task.imageAccountId) }}</small>
+                        <strong>首帧 · {{ task.firstFrameSource === 'local' ? '本地图片' : task.firstFrameSource === 'generated' ? '提示词生成' : '无' }}</strong><small>{{ task.firstFrameSource === 'generated' ? accountName(task.imageAccountId) : (task.firstFrameFileName || '纯文生视频') }}</small>
                       </div>
                       <b>→</b>
-                      <div class="pipeline-step" :class="{ locked: !!task.imagePrompt && task.imageStatus !== 'approved' }">
+                      <div class="pipeline-step" :class="{ locked: task.firstFrameSource !== 'none' && task.imageStatus !== 'approved' }">
                         <span class="badge" :class="task.status">{{ statusLabel(task.status) }}</span>
                         <strong>分镜视频</strong><small>{{ accountName(task.accountId) }}</small>
                       </div>
@@ -764,16 +830,15 @@ function handleModelChange() {
                     <details class="prompt-detail"><summary>分镜视频提示词</summary><p>{{ task.prompt }}</p></details>
                     <p v-if="task.imagePath" class="image-path">已关联：{{ fileName(task.imagePath) }}</p>
                     <div class="task-meta"><span>{{ task.model }}<template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))"> · 项目风格已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
-                    <div v-if="task.imagePrompt" class="card-actions stage-actions">
-                      <button class="primary small" @click="openImageTask(task)">打开生图页</button>
-                      <button v-if="task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending'" @click="updateImageTask(task, 'submitted')">标记已提交</button>
-                      <button v-if="task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
-                      <button @click="chooseTaskImage(task)">选择本地分镜图</button>
-                      <button v-if="task.imageStatus !== 'approved'" @click="updateImageTask(task, 'approved')">通过审核</button>
-                      <button v-if="task.imageStatus !== 'failed'" @click="updateImageTask(task, 'failed')">生图失败</button>
+                    <div v-if="task.firstFrameSource !== 'none'" class="card-actions stage-actions">
+                      <button v-if="task.firstFrameSource === 'generated'" class="primary small" @click="openImageTask(task)">打开生图页</button>
+                      <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记已提交</button>
+                      <button v-if="task.firstFrameSource === 'generated' && task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
+                      <button @click="chooseTaskImage(task)">{{ task.firstFrameSource === 'local' ? '选择本地首帧' : '选择生成结果' }}</button>
+                      <button v-if="task.firstFrameSource === 'generated' && task.imageStatus !== 'failed'" @click="updateImageTask(task, 'failed')">生图失败</button>
                     </div>
                     <div class="card-actions stage-actions">
-                      <button class="primary small" :disabled="!!task.imagePrompt && task.imageStatus !== 'approved'" @click="openTask(task)">打开视频页</button>
+                      <button class="primary small" :disabled="task.firstFrameSource !== 'none' && task.imageStatus !== 'approved'" @click="openTask(task)">打开视频页</button>
                       <button @click="copyTaskPrompt(task)">复制视频提示词</button>
                       <button @click="editTask(task)">编辑</button>
                       <button @click="duplicateTask(task)">复制为下一镜</button>
@@ -811,22 +876,38 @@ function handleModelChange() {
     <div v-if="showImportDialog" class="modal-backdrop" @click.self="showImportDialog = false">
       <form class="modal import-modal" @submit.prevent="importStoryboardTasks">
         <p class="eyebrow">BATCH STORYBOARD</p><h2>批量导入整套分镜</h2>
-        <p class="muted">支持 JSON，或“分镜 1 / 分镜图提示词 / 视频提示词 / 时长 / 画幅”Markdown 格式。导入后会自动均衡分配可用账号。</p>
+        <p class="muted">支持 JSON 或 Markdown。每个分镜可指定首帧来源；本地图片可写文件名，也可留空后按分镜编号自动匹配。</p>
         <label>项目名称（原文中有项目名称时可留空）<input v-model="importProjectName" placeholder="例如：柯基水草球短片" /></label>
-        <label>分镜内容<textarea v-model="importText" rows="15" placeholder="### 分镜 1&#10;分镜图提示词：……&#10;视频提示词：……&#10;时长：10秒&#10;画幅：9:16"></textarea></label>
+        <label>分镜内容<textarea v-model="importText" rows="12" placeholder="项目名称：柯基短片&#10;全局提示词：吉卜力风格…&#10;### 分镜 1&#10;首帧来源：本地图片&#10;首帧图：01.png&#10;视频提示词：……&#10;时长：10秒&#10;画幅：9:16"></textarea></label>
         <div v-if="importPreview.storyboard" class="import-result success">识别到 {{ importPreview.storyboard.shots.length }} 个分镜 · 项目：{{ importPreview.storyboard.projectName }}</div>
         <div v-else-if="importPreview.error" class="import-result error">{{ importPreview.error }}</div>
-        <div class="modal-actions"><button type="button" @click="showImportDialog = false">取消</button><button class="primary" type="submit" :disabled="!importPreview.storyboard">导入并自动分配</button></div>
+        <template v-if="importPreview.storyboard?.shots.some(shot => shot.firstFrameSource === 'local')">
+          <div class="asset-folder-row"><div><strong>本地首帧素材</strong><span>{{ importAssets.folderPath || '尚未选择文件夹；绝对路径可直接识别' }}</span></div><button type="button" @click="chooseImportAssetFolder">选择素材文件夹</button></div>
+          <div v-if="importAssetResolution" class="asset-preview-list">
+            <article v-for="item in importAssetResolution.shots.filter(item => importPreview.storyboard?.shots.find(shot => shot.shotNumber === item.shotNumber)?.firstFrameSource === 'local')" :key="item.shotNumber" :class="{ invalid: item.error }">
+              <img v-if="item.file?.thumbnailUrl" :src="item.file.thumbnailUrl" alt="" />
+              <div><strong>分镜 {{ item.shotNumber }}</strong><span>{{ item.file?.name || item.error }}</span><small v-if="item.warning">{{ item.warning }}</small></div>
+            </article>
+          </div>
+          <p v-if="importAssetResolution?.unusedFiles.length" class="import-warning">文件夹中还有 {{ importAssetResolution.unusedFiles.length }} 张未匹配图片，不会导入。</p>
+        </template>
+        <div v-if="importGlobalConflict" class="global-conflict">
+          <strong>导入稿的全局提示词与项目现有设置不同</strong>
+          <label><input v-model="importGlobalChoice" type="radio" value="incoming" />使用导入稿</label>
+          <label><input v-model="importGlobalChoice" type="radio" value="existing" />保留现有设置</label>
+        </div>
+        <div class="modal-actions"><button type="button" @click="showImportDialog = false">取消</button><button class="primary" type="submit" :disabled="!canImportStoryboard">导入并自动分配</button></div>
       </form>
     </div>
     <div v-if="styleTargetName" class="modal-backdrop" @click.self="styleTargetName = null">
       <form class="modal style-modal" @submit.prevent="saveProjectStyle">
-        <p class="eyebrow">PROJECT STYLE LOCK</p><h2>{{ styleForm.projectName }} · 风格锁定</h2>
-        <p class="muted">这些内容会自动合成到本项目每条生图和视频提示词。三个参考图会保存在本机；现阶段打开豆包后仍需手动上传需要使用的参考图。</p>
+        <p class="eyebrow">PROJECT GLOBAL PROMPTS</p><h2>{{ styleForm.projectName }} · 全局约束</h2>
+        <p class="muted">共用全局提示词用于两个阶段；填写阶段专用提示词后，会在该阶段替代共用版。最终提示词按“全局在前、分镜在后”拼接。</p>
+        <p v-if="styleForm.migrationPending" class="migration-banner">已将旧版五项风格锁定迁移为草稿。请检查下方内容，保存后才会正式生效。</p>
 
         <div class="reference-grid">
           <article>
-            <strong>人物定妆图</strong><span>{{ fileName(styleForm.characterReferencePath) || '未选择' }}</span>
+            <strong>角色 / 宠物定妆图</strong><span>{{ fileName(styleForm.characterReferencePath) || '未选择' }}</span>
             <div><button type="button" @click="chooseProjectReference('character')">选择</button><button v-if="styleForm.characterReferencePath" type="button" @click="clearProjectReference('character')">清除</button></div>
           </article>
           <article>
@@ -840,11 +921,9 @@ function handleModelChange() {
         </div>
 
         <div class="style-fields">
-          <label>项目固定风格<textarea v-model="styleForm.stylePrompt" rows="3" placeholder="例如：写实电影动画，低饱和暖色，自然光，35mm镜头，柔和景深…"></textarea></label>
-          <label>固定人物约束<textarea v-model="styleForm.characterPrompt" rows="3" placeholder="例如：保持人物脸型、发型、服装、年龄和体型一致…"></textarea></label>
-          <label>固定场景约束<textarea v-model="styleForm.scenePrompt" rows="3" placeholder="例如：保持住宅结构、家具位置、时间与主光方向一致…"></textarea></label>
-          <label>连续性约束<textarea v-model="styleForm.continuityPrompt" rows="3"></textarea></label>
-          <label>禁止项<textarea v-model="styleForm.negativePrompt" rows="3"></textarea></label>
+          <label>共用全局提示词<textarea v-model="styleForm.globalPrompt" rows="4" placeholder="例如：吉卜力风格宠物动画；统一角色造型、花纹、场景、光线和色彩…"></textarea></label>
+          <label>全局分镜图提示词（选填）<textarea v-model="styleForm.imageGlobalPrompt" rows="4" placeholder="填写后替代生图阶段的共用全局提示词"></textarea></label>
+          <label>全局视频提示词（选填）<textarea v-model="styleForm.videoGlobalPrompt" rows="4" placeholder="填写后替代视频阶段的共用全局提示词"></textarea></label>
         </div>
 
         <div class="lock-row">
@@ -856,7 +935,7 @@ function handleModelChange() {
         <details class="prompt-preview"><summary>查看合成后的分镜图提示词</summary><pre>{{ styleImagePreview }}</pre></details>
         <details class="prompt-preview"><summary>查看合成后的分镜视频提示词</summary><pre>{{ styleVideoPreview }}</pre></details>
 
-        <div class="modal-actions"><button type="button" @click="styleTargetName = null">取消</button><button class="primary" type="submit">保存项目风格</button></div>
+        <div class="modal-actions"><button type="button" @click="styleTargetName = null">取消</button><button class="primary" type="submit">保存并启用全局约束</button></div>
       </form>
     </div>
   </div>

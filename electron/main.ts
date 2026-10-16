@@ -1,6 +1,6 @@
 import path from "node:path";
-import { writeFileSync } from "node:fs";
-import { app, BrowserWindow, clipboard, dialog, ipcMain } from "electron";
+import { readdirSync, writeFileSync } from "node:fs";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from "electron";
 import type {
   AppSettings,
   ImageTaskStatus,
@@ -138,6 +138,7 @@ function registerIpc() {
   });
   ipcMain.handle("tasks:open-image", async (_event, id: string) => {
     const task = database.getTask(id);
+    if (task.firstFrameSource !== "generated") throw new Error("这个分镜不是提示词生成首帧");
     if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
     if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
     const account = database.getAccount(task.imageAccountId);
@@ -176,11 +177,12 @@ function registerIpc() {
   ipcMain.handle("tasks:open", async (_event, id: string) => {
     const task = database.getTask(id);
     if (!task.accountId) throw new Error("请先为任务选择账号");
-    if (task.imagePrompt && task.imageStatus !== "approved") throw new Error("请先完成并审核分镜图，再制作分镜视频");
+    if (task.firstFrameSource !== "none" && task.imageStatus !== "approved") throw new Error("请先锁定首帧，再制作分镜视频");
+    if (task.firstFrameSource !== "none" && !task.imagePath) throw new Error("首帧文件不存在，请重新选择或生成首帧");
     const account = database.getAccount(task.accountId);
     const finalPrompt = composeProjectPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
     clipboard.writeText(finalPrompt);
-    await sessions.prepare(account, "video", finalPrompt);
+    await sessions.prepare(account, "video", finalPrompt, task.firstFrameSource === "none" ? null : task.imagePath);
     return database.getTask(id);
   });
   ipcMain.handle("tasks:update-status", (_event, id: string, status: TaskStatus) => {
@@ -206,7 +208,7 @@ function registerIpc() {
     if (!["character", "scene", "style"].includes(kind)) throw new Error("参考图类型无效");
     const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
     const titles: Record<ProjectReferenceKind, string> = {
-      character: "选择人物定妆图",
+      character: "选择角色或宠物定妆图",
       scene: "选择场景参考图",
       style: "选择风格参考图"
     };
@@ -223,6 +225,33 @@ function registerIpc() {
     const count = database.applyProjectLocks(projectName);
     notifyChanged();
     return count;
+  });
+
+  ipcMain.handle("imports:choose-asset-folder", async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "选择项目首帧素材文件夹",
+      buttonLabel: "使用此文件夹",
+      properties: ["openDirectory"]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return { cancelled: true, folderPath: null, files: [] };
+    const folderPath = result.filePaths[0];
+    const files = readdirSync(folderPath, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.(png|jpe?g|webp)$/i.test(entry.name))
+      .map((entry) => {
+        const filePath = path.join(folderPath, entry.name);
+        const image = nativeImage.createFromPath(filePath);
+        const size = image.getSize();
+        return {
+          name: entry.name,
+          path: filePath,
+          width: size.width,
+          height: size.height,
+          thumbnailUrl: image.isEmpty() ? "" : image.resize({ width: 120 }).toDataURL()
+        };
+      });
+    return { cancelled: false, folderPath, files };
   });
 
   ipcMain.handle("settings:get", () => database.getSettings());

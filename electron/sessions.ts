@@ -101,9 +101,10 @@ export class AccountSessionManager {
     return win;
   }
 
-  async prepare(account: Account, route: "image" | "video", prompt: string) {
+  async prepare(account: Account, route: "image" | "video", prompt: string, attachmentPath: string | null = null) {
     const win = this.open(account, route, true);
     await waitForLoad(win);
+    if (attachmentPath) await uploadFirstFrame(win, attachmentPath);
     const deadline = Date.now() + 12_000;
     while (Date.now() < deadline) {
       if (await fillComposer(win, prompt)) return win;
@@ -219,6 +220,67 @@ function routeUrl(route: "home" | "chat" | "image" | "video") {
   if (route === "image") return DOUBAO_IMAGE;
   if (route === "video") return DOUBAO_VIDEO;
   return DOUBAO_HOME;
+}
+
+async function uploadFirstFrame(win: BrowserWindow, filePath: string) {
+  if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
+  const deadline = Date.now() + 12_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await revealImageInput(win);
+      if (await setFileInput(win, filePath)) {
+        await delay(700);
+        return;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(400);
+  }
+  throw new Error(`已打开豆包视频页，但首帧自动上传失败${lastError ? `：${errorMessage(lastError)}` : ""}；请手动上传后继续`);
+}
+
+async function revealImageInput(win: BrowserWindow) {
+  await win.webContents.executeJavaScript(`
+    (() => {
+      if (document.querySelector('input[type="file"]')) return true;
+      const labels = ['首帧', '上传图片', '上传', '参考图', '添加图片'];
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"], label'));
+      const target = candidates.find(element => {
+        const text = (element.textContent || element.getAttribute('aria-label') || '').trim();
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && labels.some(label => text.includes(label));
+      });
+      target?.click();
+      return Boolean(target);
+    })()
+  `, true);
+}
+
+async function setFileInput(win: BrowserWindow, filePath: string) {
+  const debuggerApi = win.webContents.debugger;
+  const alreadyAttached = debuggerApi.isAttached();
+  if (!alreadyAttached) debuggerApi.attach("1.3");
+  try {
+    const documentResult = await debuggerApi.sendCommand("DOM.getDocument", { depth: -1, pierce: true }) as { root: { nodeId: number } };
+    const selectors = [
+      'input[type="file"][accept*="image"]',
+      'input[type="file"]'
+    ];
+    for (const selector of selectors) {
+      const result = await debuggerApi.sendCommand("DOM.querySelector", {
+        nodeId: documentResult.root.nodeId,
+        selector
+      }) as { nodeId: number };
+      if (!result.nodeId) continue;
+      await debuggerApi.sendCommand("DOM.setFileInputFiles", { files: [filePath], nodeId: result.nodeId });
+      return true;
+    }
+    return false;
+  } finally {
+    if (!alreadyAttached && debuggerApi.isAttached()) debuggerApi.detach();
+  }
 }
 
 async function fillComposer(win: BrowserWindow, prompt: string) {

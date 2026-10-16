@@ -1,6 +1,7 @@
 export type AccountStatus = "login_required" | "ready" | "busy" | "error";
 export type TaskStatus = "queued" | "submitted" | "running" | "succeeded" | "failed" | "cancelled";
 export type ImageTaskStatus = "pending" | "preparing" | "submitted" | "ready" | "approved" | "failed" | "skipped";
+export type FirstFrameSource = "local" | "generated" | "none";
 export type UsageKind = "image" | "video";
 
 export interface Account {
@@ -19,6 +20,8 @@ export interface TaskRecord {
   id: string;
   projectName: string;
   shotNumber: number;
+  firstFrameSource: FirstFrameSource;
+  firstFrameFileName: string | null;
   imagePrompt: string;
   imageAccountId: string | null;
   imageStatus: ImageTaskStatus;
@@ -36,10 +39,14 @@ export interface TaskRecord {
   updatedAt: string;
 }
 
-export type TaskInput = Pick<
+export interface TaskInput extends Pick<
   TaskRecord,
   "projectName" | "shotNumber" | "imagePrompt" | "imageAccountId" | "accountId" | "prompt" | "model" | "duration" | "aspectRatio"
->;
+> {
+  firstFrameSource?: FirstFrameSource;
+  firstFrameFileName?: string | null;
+  sourceImagePath?: string | null;
+}
 
 export interface AccountUsage {
   accountId: string;
@@ -57,11 +64,10 @@ export type ProjectReferenceKind = "character" | "scene" | "style";
 
 export interface ProjectStyleProfile {
   projectName: string;
-  stylePrompt: string;
-  characterPrompt: string;
-  scenePrompt: string;
-  continuityPrompt: string;
-  negativePrompt: string;
+  globalPrompt: string;
+  imageGlobalPrompt: string;
+  videoGlobalPrompt: string;
+  migrationPending: boolean;
   characterReferencePath: string | null;
   sceneReferencePath: string | null;
   styleReferencePath: string | null;
@@ -71,6 +77,20 @@ export interface ProjectStyleProfile {
 }
 
 export type ProjectStyleInput = Omit<ProjectStyleProfile, "updatedAt">;
+
+export interface AssetFolderFile {
+  name: string;
+  path: string;
+  width: number;
+  height: number;
+  thumbnailUrl: string;
+}
+
+export interface AssetFolderSelection {
+  cancelled: boolean;
+  folderPath: string | null;
+  files: AssetFolderFile[];
+}
 
 export interface AppSettings {
   maxActiveWorkers: number;
@@ -145,6 +165,9 @@ export interface DesktopApi {
     saveStyle(input: ProjectStyleInput): Promise<ProjectStyleProfile>;
     chooseReference(kind: ProjectReferenceKind): Promise<string | null>;
     applyLocks(projectName: string): Promise<number>;
+  };
+  imports: {
+    chooseAssetFolder(): Promise<AssetFolderSelection>;
   };
   settings: {
     get(): Promise<AppSettings>;

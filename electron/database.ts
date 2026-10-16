@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
@@ -8,6 +8,7 @@ import type {
   AccountUsage,
   AppSettings,
   AssignmentSummary,
+  FirstFrameSource,
   ImageTaskStatus,
   ProjectStyleInput,
   ProjectStyleProfile,
@@ -24,7 +25,7 @@ const now = () => new Date().toISOString();
 export class StudioDatabase {
   private readonly db: DatabaseSync;
 
-  constructor(dataDir: string) {
+  constructor(private readonly dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
     this.db = new DatabaseSync(path.join(dataDir, "studio.sqlite"), { timeout: 5000 });
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
@@ -48,6 +49,8 @@ export class StudioDatabase {
         id TEXT PRIMARY KEY,
         project_name TEXT NOT NULL DEFAULT '',
         shot_number INTEGER NOT NULL DEFAULT 1,
+        first_frame_source TEXT NOT NULL DEFAULT 'none',
+        first_frame_file_name TEXT,
         image_prompt TEXT NOT NULL DEFAULT '',
         image_account_id TEXT,
         image_status TEXT NOT NULL DEFAULT 'skipped',
@@ -77,6 +80,10 @@ export class StudioDatabase {
       );
       CREATE TABLE IF NOT EXISTS project_styles (
         project_name TEXT PRIMARY KEY,
+        global_prompt TEXT NOT NULL DEFAULT '',
+        image_global_prompt TEXT NOT NULL DEFAULT '',
+        video_global_prompt TEXT NOT NULL DEFAULT '',
+        legacy_migration_pending INTEGER NOT NULL DEFAULT 0,
         style_prompt TEXT NOT NULL DEFAULT '',
         character_prompt TEXT NOT NULL DEFAULT '',
         scene_prompt TEXT NOT NULL DEFAULT '',
@@ -100,6 +107,12 @@ export class StudioDatabase {
     if (!taskColumns.has("shot_number")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN shot_number INTEGER NOT NULL DEFAULT 1");
     }
+    if (!taskColumns.has("first_frame_source")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN first_frame_source TEXT NOT NULL DEFAULT 'none'");
+    }
+    if (!taskColumns.has("first_frame_file_name")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN first_frame_file_name TEXT");
+    }
     if (!taskColumns.has("image_prompt")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN image_prompt TEXT NOT NULL DEFAULT ''");
     }
@@ -112,6 +125,32 @@ export class StudioDatabase {
     if (!taskColumns.has("image_path")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN image_path TEXT");
     }
+    this.db.exec(`
+      UPDATE tasks
+      SET first_frame_source = CASE
+        WHEN image_prompt != '' THEN 'generated'
+        WHEN image_path IS NOT NULL AND image_path != '' THEN 'local'
+        ELSE 'none'
+      END
+      WHERE first_frame_source IS NULL OR first_frame_source = 'none'
+    `);
+
+    const projectStyleColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(project_styles)").all() as DbRow[]).map((row) => String(row.name))
+    );
+    if (!projectStyleColumns.has("global_prompt")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN global_prompt TEXT NOT NULL DEFAULT ''");
+    }
+    if (!projectStyleColumns.has("image_global_prompt")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN image_global_prompt TEXT NOT NULL DEFAULT ''");
+    }
+    if (!projectStyleColumns.has("video_global_prompt")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN video_global_prompt TEXT NOT NULL DEFAULT ''");
+    }
+    if (!projectStyleColumns.has("legacy_migration_pending")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN legacy_migration_pending INTEGER NOT NULL DEFAULT 0");
+    }
+    this.createLegacyStyleDrafts();
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("maxActiveWorkers", "2");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("automationEnabled", "false");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("lastTaskAccountId", "");
@@ -186,19 +225,25 @@ export class StudioDatabase {
     const normalized = this.validateTaskInput(input);
     const id = randomUUID();
     const createdAt = now();
+    const imagePath = normalized.sourceImagePath ? this.storeManagedImage(normalized.sourceImagePath) : null;
+    const imageStatus = initialImageStatus(normalized.firstFrameSource, imagePath);
     this.db.prepare(`
       INSERT INTO tasks(
-        id, project_name, shot_number, image_prompt, image_account_id, image_status,
+        id, project_name, shot_number, first_frame_source, first_frame_file_name,
+        image_prompt, image_account_id, image_status, image_path,
         account_id, prompt, model, duration, aspect_ratio, status, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
     `).run(
       id,
       normalized.projectName,
       normalized.shotNumber,
+      normalized.firstFrameSource,
+      normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
       normalized.imageAccountId,
-      normalized.imagePrompt ? "pending" : "skipped",
+      imageStatus,
+      imagePath,
       normalized.accountId,
       normalized.prompt,
       normalized.model,
@@ -225,27 +270,37 @@ export class StudioDatabase {
   }
 
   updateTask(id: string, input: TaskInput): TaskRecord {
-    this.getTask(id);
+    const previous = this.getTask(id);
     const normalized = this.validateTaskInput(input);
+    const sourceChanged = previous.firstFrameSource !== normalized.firstFrameSource;
+    const promptChanged = previous.imagePrompt !== normalized.imagePrompt;
+    let imagePath = previous.imagePath;
+    if (normalized.sourceImagePath) imagePath = this.storeManagedImage(normalized.sourceImagePath);
+    else if (normalized.firstFrameSource === "none" || sourceChanged || (normalized.firstFrameSource === "generated" && promptChanged)) {
+      imagePath = null;
+    }
+    const imageStatus = normalized.firstFrameSource === "none"
+      ? "skipped"
+      : imagePath
+        ? "approved"
+        : sourceChanged || promptChanged
+          ? "pending"
+          : previous.imageStatus;
     this.db.prepare(`
       UPDATE tasks
-      SET project_name = ?, shot_number = ?, image_prompt = ?, image_account_id = ?,
-          image_status = CASE
-            WHEN ? = '' THEN 'skipped'
-            WHEN image_prompt != ? THEN 'pending'
-            ELSE image_status
-          END,
-          image_path = CASE WHEN image_prompt != ? THEN NULL ELSE image_path END,
+      SET project_name = ?, shot_number = ?, first_frame_source = ?, first_frame_file_name = ?,
+          image_prompt = ?, image_account_id = ?, image_status = ?, image_path = ?,
           account_id = ?, prompt = ?, model = ?, duration = ?, aspect_ratio = ?, updated_at = ?
       WHERE id = ?
     `).run(
       normalized.projectName,
       normalized.shotNumber,
+      normalized.firstFrameSource,
+      normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
       normalized.imageAccountId,
-      normalized.imagePrompt,
-      normalized.imagePrompt,
-      normalized.imagePrompt,
+      imageStatus,
+      imagePath,
       normalized.accountId,
       normalized.prompt,
       normalized.model,
@@ -262,6 +317,9 @@ export class StudioDatabase {
     return this.createTask({
       projectName: source.projectName,
       shotNumber: source.shotNumber + 1,
+      firstFrameSource: source.firstFrameSource,
+      firstFrameFileName: source.firstFrameFileName,
+      sourceImagePath: source.imagePath,
       imagePrompt: source.imagePrompt,
       imageAccountId: source.imageAccountId,
       accountId: source.accountId,
@@ -289,7 +347,11 @@ export class StudioDatabase {
 
   setTaskImageStatus(id: string, status: ImageTaskStatus): TaskRecord {
     const previous = this.getTask(id);
-    if (!previous.imagePrompt && status !== "skipped") throw new Error("这个分镜没有生图提示词");
+    if (previous.firstFrameSource === "none" && status !== "skipped") throw new Error("这个分镜没有首帧");
+    if (previous.firstFrameSource === "generated" && !previous.imagePrompt && status !== "skipped") {
+      throw new Error("这个分镜没有生图提示词");
+    }
+    if (status === "approved" && !previous.imagePath) throw new Error("请先选择实际首帧图片，再通过审核");
     this.db.prepare("UPDATE tasks SET image_status = ?, updated_at = ? WHERE id = ?").run(status, now(), id);
     if (status === "submitted" && ["pending", "preparing", "failed"].includes(previous.imageStatus) && previous.imageAccountId) {
       this.incrementUsage(previous.imageAccountId, "image");
@@ -298,9 +360,14 @@ export class StudioDatabase {
   }
 
   setTaskImage(id: string, imagePath: string): TaskRecord {
-    this.getTask(id);
-    this.db.prepare("UPDATE tasks SET image_path = ?, image_status = 'approved', updated_at = ? WHERE id = ?")
-      .run(imagePath, now(), id);
+    const previous = this.getTask(id);
+    const managedPath = this.storeManagedImage(imagePath);
+    const source: FirstFrameSource = previous.firstFrameSource === "none" ? "local" : previous.firstFrameSource;
+    this.db.prepare(`
+      UPDATE tasks
+      SET first_frame_source = ?, first_frame_file_name = ?, image_path = ?, image_status = 'approved', updated_at = ?
+      WHERE id = ?
+    `).run(source, path.basename(imagePath), managedPath, now(), id);
     return this.getTask(id);
   }
 
@@ -382,16 +449,21 @@ export class StudioDatabase {
     const updatedAt = now();
     this.db.prepare(`
       INSERT INTO project_styles(
-        project_name, style_prompt, character_prompt, scene_prompt, continuity_prompt, negative_prompt,
+        project_name, global_prompt, image_global_prompt, video_global_prompt, legacy_migration_pending,
+        style_prompt, character_prompt, scene_prompt, continuity_prompt, negative_prompt,
         character_reference_path, scene_reference_path, style_reference_path,
         locked_model, locked_aspect_ratio, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, 0, '', '', '', '', '', ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project_name) DO UPDATE SET
-        style_prompt = excluded.style_prompt,
-        character_prompt = excluded.character_prompt,
-        scene_prompt = excluded.scene_prompt,
-        continuity_prompt = excluded.continuity_prompt,
-        negative_prompt = excluded.negative_prompt,
+        global_prompt = excluded.global_prompt,
+        image_global_prompt = excluded.image_global_prompt,
+        video_global_prompt = excluded.video_global_prompt,
+        legacy_migration_pending = 0,
+        style_prompt = '',
+        character_prompt = '',
+        scene_prompt = '',
+        continuity_prompt = '',
+        negative_prompt = '',
         character_reference_path = excluded.character_reference_path,
         scene_reference_path = excluded.scene_reference_path,
         style_reference_path = excluded.style_reference_path,
@@ -400,11 +472,9 @@ export class StudioDatabase {
         updated_at = excluded.updated_at
     `).run(
       projectName,
-      input.stylePrompt.trim(),
-      input.characterPrompt.trim(),
-      input.scenePrompt.trim(),
-      input.continuityPrompt.trim(),
-      input.negativePrompt.trim(),
+      input.globalPrompt.trim(),
+      input.imageGlobalPrompt.trim(),
+      input.videoGlobalPrompt.trim(),
       input.characterReferencePath || null,
       input.sceneReferencePath || null,
       input.styleReferencePath || null,
@@ -480,10 +550,14 @@ export class StudioDatabase {
     return this.getSettings();
   }
 
-  private validateTaskInput(input: TaskInput): TaskInput {
+  private validateTaskInput(input: TaskInput): TaskInput & { firstFrameSource: FirstFrameSource } {
     const prompt = input.prompt.trim();
     const imagePrompt = input.imagePrompt.trim();
+    const firstFrameSource = normalizeFirstFrameSource(input.firstFrameSource, imagePrompt, input.sourceImagePath);
     if (!prompt) throw new Error("分镜视频提示词不能为空");
+    if (firstFrameSource === "generated" && !imagePrompt) throw new Error("提示词生成首帧必须填写分镜图提示词");
+    if (firstFrameSource === "none" && imagePrompt) throw new Error("纯文生视频不能同时填写分镜图提示词");
+    if (firstFrameSource === "local" && imagePrompt) throw new Error("本地首帧不能同时填写分镜图提示词");
     if (input.accountId) this.getAccount(input.accountId);
     if (input.imageAccountId) this.getAccount(input.imageAccountId);
     const duration = Math.round(Number(input.duration));
@@ -494,6 +568,9 @@ export class StudioDatabase {
       ...input,
       projectName: input.projectName.trim(),
       shotNumber: Math.max(1, Math.round(Number(input.shotNumber) || 1)),
+      firstFrameSource,
+      firstFrameFileName: input.firstFrameFileName?.trim() || null,
+      sourceImagePath: input.sourceImagePath || null,
       imagePrompt,
       prompt,
       duration
@@ -502,6 +579,47 @@ export class StudioDatabase {
 
   close() {
     this.db.close();
+  }
+
+  private createLegacyStyleDrafts() {
+    const rows = this.db.prepare(`
+      SELECT * FROM project_styles
+      WHERE legacy_migration_pending = 0
+        AND global_prompt = '' AND image_global_prompt = '' AND video_global_prompt = ''
+        AND (style_prompt != '' OR character_prompt != '' OR scene_prompt != '' OR continuity_prompt != '' OR negative_prompt != '')
+    `).all() as DbRow[];
+    const update = this.db.prepare(`
+      UPDATE project_styles
+      SET image_global_prompt = ?, video_global_prompt = ?, legacy_migration_pending = 1
+      WHERE project_name = ?
+    `);
+    for (const row of rows) {
+      const imageDraft = legacySections([
+        ["项目固定风格", row.style_prompt],
+        ["固定角色", row.character_prompt],
+        ["固定场景", row.scene_prompt],
+        ["禁止项", row.negative_prompt]
+      ]);
+      const videoDraft = legacySections([
+        ["连续性约束", row.continuity_prompt],
+        ["禁止项", row.negative_prompt]
+      ]);
+      update.run(imageDraft, videoDraft, String(row.project_name));
+    }
+  }
+
+  private storeManagedImage(sourcePath: string) {
+    const resolved = path.resolve(sourcePath);
+    if (!existsSync(resolved)) throw new Error(`首帧图片不存在：${sourcePath}`);
+    const bytes = readFileSync(resolved);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const extension = path.extname(resolved).toLowerCase();
+    if (![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) throw new Error("首帧图片格式不支持");
+    const targetDir = path.join(this.dataDir, "assets", "first-frames");
+    mkdirSync(targetDir, { recursive: true });
+    const target = path.join(targetDir, `${hash}${extension === ".jpeg" ? ".jpg" : extension}`);
+    if (!existsSync(target)) copyFileSync(resolved, target);
+    return target;
   }
 }
 
@@ -515,6 +633,31 @@ function localUsageDate() {
 
 function clampWorkers(value: number) {
   return Math.min(3, Math.max(1, Math.round(Number.isFinite(value) ? value : 2)));
+}
+
+function normalizeFirstFrameSource(
+  value: FirstFrameSource | undefined,
+  imagePrompt: string,
+  sourceImagePath?: string | null
+): FirstFrameSource {
+  if (value && ["local", "generated", "none"].includes(value)) return value;
+  if (sourceImagePath) return "local";
+  if (imagePrompt) return "generated";
+  return "none";
+}
+
+function initialImageStatus(source: FirstFrameSource | undefined, imagePath: string | null): ImageTaskStatus {
+  if (source === "none") return "skipped";
+  if (imagePath) return "approved";
+  return "pending";
+}
+
+function legacySections(sections: Array<[string, string | number | null | undefined]>) {
+  return sections
+    .map(([title, value]) => [title, value == null ? "" : String(value).trim()] as const)
+    .filter(([, value]) => value)
+    .map(([title, value]) => `【${title}】\n${value}`)
+    .join("\n\n");
 }
 
 function rowToAccount(row: DbRow): Account {
@@ -536,6 +679,8 @@ function rowToTask(row: DbRow): TaskRecord {
     id: String(row.id),
     projectName: row.project_name ? String(row.project_name) : "",
     shotNumber: Math.max(1, Number(row.shot_number) || 1),
+    firstFrameSource: String(row.first_frame_source || (row.image_prompt ? "generated" : row.image_path ? "local" : "none")) as FirstFrameSource,
+    firstFrameFileName: row.first_frame_file_name ? String(row.first_frame_file_name) : null,
     imagePrompt: row.image_prompt ? String(row.image_prompt) : "",
     imageAccountId: row.image_account_id ? String(row.image_account_id) : null,
     imageStatus: String(row.image_status || (row.image_prompt ? "pending" : "skipped")) as ImageTaskStatus,
@@ -566,11 +711,10 @@ function rowToUsage(row: DbRow): AccountUsage {
 function rowToProjectStyle(row: DbRow): ProjectStyleProfile {
   return {
     projectName: String(row.project_name),
-    stylePrompt: String(row.style_prompt || ""),
-    characterPrompt: String(row.character_prompt || ""),
-    scenePrompt: String(row.scene_prompt || ""),
-    continuityPrompt: String(row.continuity_prompt || ""),
-    negativePrompt: String(row.negative_prompt || ""),
+    globalPrompt: String(row.global_prompt || ""),
+    imageGlobalPrompt: String(row.image_global_prompt || ""),
+    videoGlobalPrompt: String(row.video_global_prompt || ""),
+    migrationPending: Boolean(Number(row.legacy_migration_pending || 0)),
     characterReferencePath: row.character_reference_path ? String(row.character_reference_path) : null,
     sceneReferencePath: row.scene_reference_path ? String(row.scene_reference_path) : null,
     styleReferencePath: row.style_reference_path ? String(row.style_reference_path) : null,

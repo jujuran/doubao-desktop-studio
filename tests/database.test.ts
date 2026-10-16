@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -194,11 +194,10 @@ describe("StudioDatabase", () => {
     });
     const profile = db.saveProjectStyle({
       projectName: "统一风格短片",
-      stylePrompt: "低饱和写实电影风格",
-      characterPrompt: "保持人物定妆一致",
-      scenePrompt: "保持室内布局一致",
-      continuityPrompt: "光线方向连续",
-      negativePrompt: "禁止换装",
+      globalPrompt: "低饱和写实电影风格",
+      imageGlobalPrompt: "保持宠物定妆与室内布局一致",
+      videoGlobalPrompt: "光线方向连续，禁止换装",
+      migrationPending: false,
       characterReferencePath: "C:\\refs\\character.png",
       sceneReferencePath: null,
       styleReferencePath: null,
@@ -206,13 +205,66 @@ describe("StudioDatabase", () => {
       lockedAspectRatio: "9:16"
     });
 
-    expect(profile.stylePrompt).toBe("低饱和写实电影风格");
+    expect(profile.globalPrompt).toBe("低饱和写实电影风格");
     expect(db.applyProjectLocks(profile.projectName)).toBe(1);
     expect(db.getTask(task.id)).toMatchObject({
       model: "Seedance 2.0 mini",
       duration: 15,
       aspectRatio: "9:16"
     });
+    db.close();
+  });
+
+  it("copies a local first frame into managed storage and locks it", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-local-frame-"));
+    tempDirs.push(dir);
+    const source = path.join(dir, "01.png");
+    writeFileSync(source, "fake image bytes");
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const task = db.createTask({
+      projectName: "本地首帧",
+      shotNumber: 1,
+      firstFrameSource: "local",
+      firstFrameFileName: "01.png",
+      sourceImagePath: source,
+      imagePrompt: "",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "小狗抬头",
+      model: "Seedance 2.0 mini",
+      duration: 10,
+      aspectRatio: "9:16"
+    });
+    expect(task.imageStatus).toBe("approved");
+    expect(task.imagePath).not.toBe(source);
+    expect(existsSync(task.imagePath!)).toBe(true);
+    db.close();
+  });
+
+  it("migrates old style fields into inactive global-prompt drafts", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-style-migration-"));
+    tempDirs.push(dir);
+    const legacy = new DatabaseSync(path.join(dir, "studio.sqlite"));
+    legacy.exec(`
+      CREATE TABLE project_styles (
+        project_name TEXT PRIMARY KEY,
+        style_prompt TEXT NOT NULL DEFAULT '', character_prompt TEXT NOT NULL DEFAULT '',
+        scene_prompt TEXT NOT NULL DEFAULT '', continuity_prompt TEXT NOT NULL DEFAULT '',
+        negative_prompt TEXT NOT NULL DEFAULT '', character_reference_path TEXT,
+        scene_reference_path TEXT, style_reference_path TEXT, locked_model TEXT,
+        locked_aspect_ratio TEXT, updated_at TEXT NOT NULL
+      );
+      INSERT INTO project_styles VALUES (
+        '旧项目', '吉卜力风格', '固定柯基花纹', '', '动作连续', '禁止文字',
+        NULL, NULL, NULL, NULL, NULL, '2026-01-01'
+      );
+    `);
+    legacy.close();
+    const db = new StudioDatabase(dir);
+    const profile = db.getProjectStyle("旧项目")!;
+    expect(profile.migrationPending).toBe(true);
+    expect(profile.imageGlobalPrompt).toContain("吉卜力风格");
+    expect(profile.videoGlobalPrompt).toContain("动作连续");
     db.close();
   });
 });

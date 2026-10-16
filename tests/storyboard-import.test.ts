@@ -5,6 +5,7 @@ describe("storyboard import", () => {
   it("parses a JSON storyboard with Chinese aliases", () => {
     const result = parseStoryboard(JSON.stringify({
       项目名称: "雨夜短片",
+      全局提示词: "统一雨夜动画风格",
       分镜: [{
         分镜编号: 1,
         分镜图提示词: "雨夜街道静帧",
@@ -14,14 +15,33 @@ describe("storyboard import", () => {
       }]
     }));
     expect(result.projectName).toBe("雨夜短片");
+    expect(result.globalPrompt).toBe("统一雨夜动画风格");
     expect(result.shots[0]).toMatchObject({
       shotNumber: 1,
       imagePrompt: "雨夜街道静帧",
       videoPrompt: "镜头缓慢向前推进",
       duration: 8,
       aspectRatio: "16:9",
-      model: "Seedance 2.0 mini"
+      model: "Seedance 2.0 mini",
+      firstFrameSource: "generated"
     });
+  });
+
+  it("parses local and text-only first-frame routes", () => {
+    const result = parseStoryboard(`
+项目名称：首帧测试
+全局视频提示词：保持吉卜力宠物动画风格
+### 分镜 1
+首帧来源：本地图片
+首帧图：01.png
+视频提示词：小狗转头
+### 分镜 2
+首帧来源：无
+视频提示词：纯文字生成远景
+`);
+    expect(result.videoGlobalPrompt).toContain("吉卜力");
+    expect(result.shots[0]).toMatchObject({ firstFrameSource: "local", firstFrameImage: "01.png" });
+    expect(result.shots[1].firstFrameSource).toBe("none");
   });
 
   it("parses multiline Markdown shots", () => {

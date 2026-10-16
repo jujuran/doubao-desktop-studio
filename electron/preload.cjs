@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld("desktopApi", {
     chooseReference: (kind) => ipcRenderer.invoke("projects:choose-reference", kind),
     applyLocks: (projectName) => ipcRenderer.invoke("projects:apply-locks", projectName)
   },
+  imports: {
+    chooseAssetFolder: () => ipcRenderer.invoke("imports:choose-asset-folder")
+  },
   settings: {
     get: () => ipcRenderer.invoke("settings:get"),
     update: (input) => ipcRenderer.invoke("settings:update", input)
