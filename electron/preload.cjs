@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
     duplicate: (id) => ipcRenderer.invoke("tasks:duplicate", id),
     remove: (id) => ipcRenderer.invoke("tasks:remove", id),
     copyPrompt: (id) => ipcRenderer.invoke("tasks:copy-prompt", id),
+    chooseSourceImage: () => ipcRenderer.invoke("tasks:choose-source-image"),
     openImage: (id) => ipcRenderer.invoke("tasks:open-image", id),
     chooseImage: (id) => ipcRenderer.invoke("tasks:choose-image", id),
     updateImageStatus: (id, status) => ipcRenderer.invoke("tasks:update-image-status", id, status),

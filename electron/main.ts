@@ -14,7 +14,8 @@ import { initializeDataLocation, scheduleDataMigration } from "./data-location.j
 import { StudioDatabase } from "./database.js";
 import { DiagnosticsLogger, type DiagnosticLevel } from "./diagnostics.js";
 import { AccountSessionManager } from "./sessions.js";
-import { composeProjectPrompt } from "../src/prompt-compose.js";
+import { composeDeliveryPrompt } from "../src/prompt-compose.js";
+import { inferAspectRatio } from "../src/storyboard-assets.js";
 
 const appDataPath = app.getPath("appData");
 const defaultUserDataPath = app.getPath("userData");
@@ -134,7 +135,22 @@ function registerIpc() {
   });
   ipcMain.handle("tasks:copy-prompt", (_event, id: string) => {
     const task = database.getTask(id);
-    clipboard.writeText(composeProjectPrompt("video", task.prompt, database.getProjectStyle(task.projectName)));
+    clipboard.writeText(composeDeliveryPrompt("video", task.prompt, database.getProjectStyle(task.projectName)));
+  });
+  ipcMain.handle("tasks:choose-source-image", async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "选择分镜首帧",
+      buttonLabel: "使用这张图",
+      properties: ["openFile"],
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    const selected = result.canceled ? null : result.filePaths[0] ?? null;
+    if (!selected) return null;
+    const image = nativeImage.createFromPath(selected);
+    const size = image.isEmpty() ? { width: 0, height: 0 } : image.getSize();
+    return { path: selected, name: path.basename(selected), aspectRatio: inferAspectRatio(size.width, size.height) };
   });
   ipcMain.handle("tasks:open-image", async (_event, id: string) => {
     const task = database.getTask(id);
@@ -142,11 +158,11 @@ function registerIpc() {
     if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
     if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
     const account = database.getAccount(task.imageAccountId);
-    const finalPrompt = composeProjectPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
+    const finalPrompt = composeDeliveryPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
     clipboard.writeText(finalPrompt);
     database.setTaskImageStatus(id, "preparing");
     notifyChanged();
-    await sessions.prepare(account, "image", finalPrompt);
+    await sessions.prepare(account, "image", finalPrompt, null, undefined, task.aspectRatio);
     return database.getTask(id);
   });
   ipcMain.handle("tasks:choose-image", async (event, id: string) => {
@@ -160,7 +176,10 @@ function registerIpc() {
     };
     const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
     if (result.canceled || !result.filePaths[0]) return null;
-    const task = database.setTaskImage(id, result.filePaths[0]);
+    const selectedPath = result.filePaths[0];
+    const image = nativeImage.createFromPath(selectedPath);
+    const size = image.isEmpty() ? { width: 0, height: 0 } : image.getSize();
+    const task = database.setTaskImage(id, selectedPath, inferAspectRatio(size.width, size.height));
     notifyChanged();
     return task;
   });
@@ -176,14 +195,32 @@ function registerIpc() {
   });
   ipcMain.handle("tasks:open", async (_event, id: string) => {
     const task = database.getTask(id);
-    if (!task.accountId) throw new Error("请先为任务选择账号");
-    if (task.firstFrameSource !== "none" && task.imageStatus !== "approved") throw new Error("请先锁定首帧，再制作分镜视频");
-    if (task.firstFrameSource !== "none" && !task.imagePath) throw new Error("首帧文件不存在，请重新选择或生成首帧");
-    const account = database.getAccount(task.accountId);
-    const finalPrompt = composeProjectPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
-    clipboard.writeText(finalPrompt);
-    await sessions.prepare(account, "video", finalPrompt, task.firstFrameSource === "none" ? null : task.imagePath);
-    return database.getTask(id);
+    try {
+      if (!task.accountId) throw new Error("请先为任务选择账号");
+      if (task.firstFrameSource !== "none" && task.imageStatus !== "approved") throw new Error("请先锁定首帧，再制作分镜视频");
+      if (task.firstFrameSource !== "none" && !task.imagePath) throw new Error("首帧文件不存在，请重新选择或生成首帧");
+      const account = database.getAccount(task.accountId);
+      const finalPrompt = composeDeliveryPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
+      clipboard.writeText(finalPrompt);
+      diagnostics.info("video_task_prepare_started", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
+      await sessions.prepare(
+        account,
+        "video",
+        finalPrompt,
+        task.firstFrameSource === "none" ? null : task.imagePath,
+        { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio }
+      );
+      const updated = database.setTaskStatus(id, task.status === "failed" ? "queued" : task.status, null);
+      diagnostics.info("video_task_prepare_completed", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
+      notifyChanged();
+      return updated;
+    } catch (error) {
+      const message = errorMessage(error);
+      const updated = database.setTaskStatus(id, "failed", message);
+      diagnostics.error("video_task_prepare_failed", { taskId: shortTaskId(id), message });
+      notifyChanged();
+      throw Object.assign(new Error(message), { task: updated });
+    }
   });
   ipcMain.handle("tasks:update-status", (_event, id: string, status: TaskStatus) => {
     const task = database.setTaskStatus(id, status);
@@ -407,6 +444,10 @@ function errorMessage(error: unknown) {
 
 function shortAccountId(accountId: string) {
   return accountId.slice(0, 8);
+}
+
+function shortTaskId(taskId: string) {
+  return taskId.slice(0, 8);
 }
 
 function logDiagnostic(level: DiagnosticLevel, event: string, details?: Record<string, unknown>) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectStyleProfile } from "../electron/contracts";
-import { composeProjectPrompt, hasProjectStyle } from "../src/prompt-compose";
+import { composeDeliveryPrompt, composeProjectPrompt, hasProjectStyle } from "../src/prompt-compose";
 
 const profile: ProjectStyleProfile = {
   projectName: "测试短片",
@@ -30,6 +30,13 @@ describe("project prompt composition", () => {
     expect(composeProjectPrompt("image", "  单独提示词  ", null)).toBe("单独提示词");
     expect(hasProjectStyle(null)).toBe(false);
     expect(hasProjectStyle(profile)).toBe(true);
+  });
+
+  it("removes section headings from prompts delivered to Doubao", () => {
+    const prompt = composeDeliveryPrompt("video", "人物缓慢转头", profile);
+    expect(prompt).not.toContain("【");
+    expect(prompt).toContain("延续上一镜光线方向");
+    expect(prompt).toContain("人物缓慢转头");
   });
 
   it("keeps migrated legacy drafts inactive until they are confirmed", () => {

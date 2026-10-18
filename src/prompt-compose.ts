@@ -3,6 +3,14 @@ import type { ProjectStyleProfile } from "../electron/contracts.js";
 export type PromptStage = "image" | "video";
 
 export function composeProjectPrompt(stage: PromptStage, shotPrompt: string, profile?: ProjectStyleProfile | null) {
+  return compose(stage, shotPrompt, profile, true);
+}
+
+export function composeDeliveryPrompt(stage: PromptStage, shotPrompt: string, profile?: ProjectStyleProfile | null) {
+  return compose(stage, shotPrompt, profile, false);
+}
+
+function compose(stage: PromptStage, shotPrompt: string, profile: ProjectStyleProfile | null | undefined, headings: boolean) {
   if (!profile || profile.migrationPending || !hasProjectStyle(profile)) return shotPrompt.trim();
   const stagePrompt = stage === "image" ? profile.imageGlobalPrompt : profile.videoGlobalPrompt;
   const globalPrompt = stagePrompt.trim() || profile.globalPrompt.trim();
@@ -12,9 +20,10 @@ export function composeProjectPrompt(stage: PromptStage, shotPrompt: string, pro
   ];
   const references = referenceInstruction(profile);
   if (references) sections.splice(1, 0, ["参考素材约束", references]);
-  return sections
+  const included = sections
     .filter(([, value]) => value.trim())
-    .map(([title, value]) => `【${title}】\n${value.trim()}`)
+  return included
+    .map(([title, value]) => headings ? `【${title}】\n${value.trim()}` : value.trim())
     .join("\n\n");
 }
 

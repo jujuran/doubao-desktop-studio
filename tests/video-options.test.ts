@@ -13,8 +13,7 @@ describe("video task options", () => {
     expect(seedance25).toBeDefined();
     const options = durationOptions(seedance25!);
 
-    expect(options[0]).toBe(-1);
-    expect(options.slice(1)).toEqual(Array.from({ length: 27 }, (_, index) => index + 4));
+    expect(options).toEqual(Array.from({ length: 27 }, (_, index) => index + 4));
   });
 
   it("includes the current Seedance model family and applies model-specific limits", () => {

@@ -1,5 +1,5 @@
-import type { AssetFolderFile } from "../electron/contracts";
-import type { ImportedShot } from "./storyboard-import";
+import type { AssetFolderFile } from "../electron/contracts.js";
+import type { ImportedShot } from "./storyboard-import.js";
 
 export interface ResolvedStoryboardAsset {
   shotNumber: number;
@@ -39,7 +39,7 @@ export function resolveStoryboardAssets(shots: ImportedShot[], files: AssetFolde
       shotNumber: shot.shotNumber,
       file,
       error: "",
-      warning: aspectWarning(file, shot.aspectRatio)
+      warning: aspectWarning(file, shot.aspectRatioExplicit ? shot.aspectRatio : inferAspectRatio(file.width, file.height))
     };
   });
   return {
@@ -77,6 +77,18 @@ function aspectWarning(file: AssetFolderFile, aspectRatio: string) {
   if (!width || !height) return "";
   const delta = Math.abs(file.width / file.height - width / height) / (width / height);
   return delta > 0.03 ? `图片 ${file.width}×${file.height} 与目标画幅 ${aspectRatio} 不一致` : "";
+}
+
+export function inferAspectRatio(width: number, height: number) {
+  if (!width || !height) return "9:16";
+  const value = width / height;
+  const ratios = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"];
+  return ratios
+    .map((ratio) => {
+      const [ratioWidth, ratioHeight] = ratio.split(":").map(Number);
+      return { ratio, delta: Math.abs(value - ratioWidth / ratioHeight) };
+    })
+    .sort((left, right) => left.delta - right.delta)[0].ratio;
 }
 
 function normalizeName(value: string) {

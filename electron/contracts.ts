@@ -3,6 +3,7 @@ export type TaskStatus = "queued" | "submitted" | "running" | "succeeded" | "fai
 export type ImageTaskStatus = "pending" | "preparing" | "submitted" | "ready" | "approved" | "failed" | "skipped";
 export type FirstFrameSource = "local" | "generated" | "none";
 export type UsageKind = "image" | "video";
+export type ParameterSource = "shot" | "project" | "first_frame" | "default";
 
 export interface Account {
   id: string;
@@ -20,6 +21,9 @@ export interface TaskRecord {
   id: string;
   projectName: string;
   shotNumber: number;
+  shotName: string;
+  narration: string;
+  notes: string;
   firstFrameSource: FirstFrameSource;
   firstFrameFileName: string | null;
   imagePrompt: string;
@@ -29,8 +33,11 @@ export interface TaskRecord {
   accountId: string | null;
   prompt: string;
   model: string;
+  modelSource: ParameterSource;
   duration: number;
+  durationSource: ParameterSource;
   aspectRatio: string;
+  aspectRatioSource: ParameterSource;
   status: TaskStatus;
   resultUrl: string | null;
   resultPath: string | null;
@@ -43,6 +50,12 @@ export interface TaskInput extends Pick<
   TaskRecord,
   "projectName" | "shotNumber" | "imagePrompt" | "imageAccountId" | "accountId" | "prompt" | "model" | "duration" | "aspectRatio"
 > {
+  shotName?: string;
+  narration?: string;
+  notes?: string;
+  modelSource?: ParameterSource;
+  durationSource?: ParameterSource;
+  aspectRatioSource?: ParameterSource;
   firstFrameSource?: FirstFrameSource;
   firstFrameFileName?: string | null;
   sourceImagePath?: string | null;
@@ -149,6 +162,7 @@ export interface DesktopApi {
     duplicate(id: string): Promise<TaskRecord>;
     remove(id: string): Promise<void>;
     copyPrompt(id: string): Promise<void>;
+    chooseSourceImage(): Promise<{ path: string; name: string; aspectRatio: string } | null>;
     openImage(id: string): Promise<TaskRecord>;
     chooseImage(id: string): Promise<TaskRecord | null>;
     updateImageStatus(id: string, status: ImageTaskStatus): Promise<TaskRecord>;

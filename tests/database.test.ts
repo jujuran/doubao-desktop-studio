@@ -58,6 +58,9 @@ describe("StudioDatabase", () => {
     const created = db.createTask({
       projectName: "秋日短片",
       shotNumber: 1,
+      shotName: "转场",
+      narration: "今天去散步",
+      notes: "保留鸟叫",
       imagePrompt: "一片金色树林，静态电影感构图",
       imageAccountId: account.id,
       accountId: account.id,
@@ -70,6 +73,7 @@ describe("StudioDatabase", () => {
     const duplicated = db.duplicateTask(created.id);
 
     expect(updated.prompt).toBe("金色树叶随风飘落");
+    expect(updated.narration).toBe("今天去散步");
     expect(updated.imageStatus).toBe("pending");
     expect(duplicated.projectName).toBe("秋日短片");
     expect(duplicated.shotNumber).toBe(2);
@@ -179,6 +183,26 @@ describe("StudioDatabase", () => {
     db.close();
   });
 
+  it("persists a video preparation error until a successful retry clears it", () => {
+    const db = createDatabase();
+    const task = db.createTask({
+      projectName: "错误展示",
+      shotNumber: 1,
+      imagePrompt: "",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "视频提示词",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+
+    expect(db.setTaskStatus(task.id, "failed", "视频准备停在【设置模型、比例和时长】步骤：弹层未打开"))
+      .toMatchObject({ status: "failed", errorMessage: expect.stringContaining("设置模型、比例和时长") });
+    expect(db.setTaskStatus(task.id, "queued", null)).toMatchObject({ status: "queued", errorMessage: null });
+    db.close();
+  });
+
   it("stores project style profiles and applies locked settings", () => {
     const db = createDatabase();
     const task = db.createTask({
@@ -189,8 +213,11 @@ describe("StudioDatabase", () => {
       accountId: null,
       prompt: "人物转头",
       model: "Seedance 2.5",
+      modelSource: "default",
       duration: 20,
-      aspectRatio: "16:9"
+      durationSource: "default",
+      aspectRatio: "16:9",
+      aspectRatioSource: "default"
     });
     const profile = db.saveProjectStyle({
       projectName: "统一风格短片",
@@ -210,7 +237,10 @@ describe("StudioDatabase", () => {
     expect(db.getTask(task.id)).toMatchObject({
       model: "Seedance 2.0 mini",
       duration: 15,
-      aspectRatio: "9:16"
+      aspectRatio: "9:16",
+      modelSource: "project",
+      durationSource: "project",
+      aspectRatioSource: "project"
     });
     db.close();
   });

@@ -5,7 +5,6 @@ import type {
   AccountUsage,
   AssetFolderSelection,
   AppSettings,
-  FirstFrameSource,
   ImageTaskStatus,
   ProjectReferenceKind,
   ProjectStyleInput,
@@ -17,7 +16,7 @@ import type {
 } from "../electron/contracts";
 import appIcon from "./assets/app-icon.png";
 import { parseStoryboard } from "./storyboard-import";
-import { resolveStoryboardAssets } from "./storyboard-assets";
+import { inferAspectRatio, resolveStoryboardAssets } from "./storyboard-assets";
 import { composeProjectPrompt, hasProjectStyle } from "./prompt-compose";
 import {
   aspectRatioLabel,
@@ -60,6 +59,11 @@ const showAccountDialog = ref(false);
 const renameAccountTarget = ref<Account | null>(null);
 const renameAccountLabel = ref("");
 const editingTaskId = ref<string | null>(null);
+const showTaskDialog = ref(false);
+const taskLocalImagePath = ref("");
+const taskLocalImageName = ref("");
+const taskAspectFromFrame = ref(false);
+const taskParameterTouched = reactive({ model: false, duration: false, aspectRatio: false });
 const showImportDialog = ref(false);
 const importText = ref("");
 const importProjectName = ref("");
@@ -82,7 +86,9 @@ const styleForm = reactive<ProjectStyleInput>({
 const taskForm = reactive({
   projectName: "",
   shotNumber: 1,
-  firstFrameSource: "none" as FirstFrameSource,
+  shotName: "",
+  narration: "",
+  notes: "",
   imagePrompt: "",
   imageAccountId: "",
   accountId: "",
@@ -190,8 +196,8 @@ async function refreshData() {
   usage.value = nextUsage;
   projectStyles.value = nextProjectStyles;
   if (!taskDefaultsLoaded) {
-    const savedAccount = readyAccounts.value.find((account) => account.id === nextSettings.lastTaskAccountId);
-    taskForm.accountId = savedAccount?.id ?? readyAccounts.value[0]?.id ?? "";
+    taskForm.imageAccountId = "";
+    taskForm.accountId = "";
     taskForm.model = VIDEO_MODEL_OPTIONS.some((model) => model.value === nextSettings.lastVideoModel)
       ? nextSettings.lastVideoModel
       : DEFAULT_VIDEO_MODEL.value;
@@ -275,21 +281,40 @@ async function removeAccount(account: Account) {
 }
 
 async function saveTask() {
+  if (taskLocalImagePath.value && taskForm.imagePrompt.trim()) {
+    flash("首帧图和分镜图提示词只能保留一个，请先清除其中一项", true);
+    return;
+  }
   await act(async () => {
+    const previous = editingTaskId.value ? tasks.value.find((task) => task.id === editingTaskId.value) : null;
+    const firstFrameSource = taskLocalImagePath.value ? "local" : taskForm.imagePrompt.trim() ? "generated" : "none";
     const input: TaskInput = {
       projectName: taskForm.projectName,
       shotNumber: Number(taskForm.shotNumber),
-      firstFrameSource: taskForm.firstFrameSource,
-      firstFrameFileName: editingTaskId.value && taskForm.firstFrameSource !== "none"
-        ? tasks.value.find((task) => task.id === editingTaskId.value)?.firstFrameFileName ?? null
-        : null,
+      shotName: taskForm.shotName,
+      narration: taskForm.narration,
+      notes: taskForm.notes,
+      firstFrameSource,
+      firstFrameFileName: firstFrameSource === "local"
+        ? taskLocalImageName.value || previous?.firstFrameFileName || null
+        : firstFrameSource === "generated" && previous?.firstFrameSource === "generated"
+          ? previous.firstFrameFileName
+          : null,
+      sourceImagePath: firstFrameSource === "local" ? taskLocalImagePath.value : null,
       imagePrompt: taskForm.imagePrompt,
       imageAccountId: taskForm.imageAccountId || null,
       accountId: taskForm.accountId || null,
       prompt: taskForm.prompt,
       model: taskForm.model,
+      modelSource: previous && previous.model === taskForm.model ? previous.modelSource : taskParameterTouched.model ? "shot" : "default",
       duration: Number(taskForm.duration),
-      aspectRatio: taskForm.aspectRatio
+      durationSource: previous && previous.duration === Number(taskForm.duration) ? previous.durationSource : taskParameterTouched.duration ? "shot" : "default",
+      aspectRatio: taskForm.aspectRatio,
+      aspectRatioSource: taskAspectFromFrame.value
+        ? "first_frame"
+        : previous && previous.aspectRatio === taskForm.aspectRatio
+          ? previous.aspectRatioSource
+          : taskParameterTouched.aspectRatio ? "shot" : "default"
     };
     if (editingTaskId.value) await window.desktopApi.tasks.update(editingTaskId.value, input);
     else await window.desktopApi.tasks.create(input);
@@ -301,7 +326,14 @@ async function saveTask() {
     });
     const wasEditing = Boolean(editingTaskId.value);
     editingTaskId.value = null;
+    showTaskDialog.value = false;
+    taskLocalImagePath.value = "";
+    taskLocalImageName.value = "";
+    taskAspectFromFrame.value = false;
     taskForm.imagePrompt = "";
+    taskForm.shotName = "";
+    taskForm.narration = "";
+    taskForm.notes = "";
     taskForm.prompt = "";
     if (!wasEditing) taskForm.shotNumber += 1;
     flash(wasEditing ? "任务修改已保存" : "任务已保存，可继续填写下一分镜");
@@ -312,7 +344,11 @@ function editTask(task: TaskRecord) {
   editingTaskId.value = task.id;
   taskForm.projectName = task.projectName;
   taskForm.shotNumber = task.shotNumber;
-  taskForm.firstFrameSource = task.firstFrameSource;
+  taskForm.shotName = task.shotName;
+  taskForm.narration = task.narration;
+  taskForm.notes = task.notes;
+  taskLocalImagePath.value = task.firstFrameSource === "local" ? task.imagePath || "" : "";
+  taskLocalImageName.value = task.firstFrameSource === "local" ? task.firstFrameFileName || fileName(task.imagePath) : "";
   taskForm.imagePrompt = task.imagePrompt;
   taskForm.imageAccountId = task.imageAccountId ?? "";
   taskForm.accountId = task.accountId ?? "";
@@ -321,23 +357,75 @@ function editTask(task: TaskRecord) {
   taskForm.duration = task.duration;
   taskForm.aspectRatio = task.aspectRatio;
   handleModelChange();
-  document.querySelector(".task-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  Object.assign(taskParameterTouched, { model: false, duration: false, aspectRatio: false });
+  taskAspectFromFrame.value = false;
+  showTaskDialog.value = true;
 }
 
 function cancelTaskEdit() {
   editingTaskId.value = null;
+  showTaskDialog.value = false;
   taskForm.imagePrompt = "";
-  taskForm.firstFrameSource = "none";
+  taskForm.shotName = "";
+  taskForm.narration = "";
+  taskForm.notes = "";
   taskForm.prompt = "";
-  taskForm.projectName = "";
-  taskForm.shotNumber = 1;
+  taskLocalImagePath.value = "";
+  taskLocalImageName.value = "";
+  taskAspectFromFrame.value = false;
+  Object.assign(taskParameterTouched, { model: false, duration: false, aspectRatio: false });
   restoreTaskDefaults();
 }
 
+function openNewTask() {
+  editingTaskId.value = null;
+  taskForm.shotName = "";
+  taskForm.narration = "";
+  taskForm.notes = "";
+  taskForm.imagePrompt = "";
+  taskForm.prompt = "";
+  taskLocalImagePath.value = "";
+  taskLocalImageName.value = "";
+  taskAspectFromFrame.value = false;
+  Object.assign(taskParameterTouched, { model: false, duration: false, aspectRatio: false });
+  const currentProject = taskForm.projectName.trim() || tasks.value[0]?.projectName || "";
+  taskForm.projectName = currentProject;
+  taskForm.shotNumber = Math.max(0, ...tasks.value.filter((task) => task.projectName === currentProject).map((task) => task.shotNumber)) + 1;
+  restoreTaskDefaults();
+  showTaskDialog.value = true;
+}
+
+async function chooseTaskSourceImage() {
+  const selected = await window.desktopApi.tasks.chooseSourceImage();
+  if (!selected) return;
+  taskLocalImagePath.value = selected.path;
+  taskLocalImageName.value = selected.name;
+  const previous = editingTaskId.value ? tasks.value.find((task) => task.id === editingTaskId.value) : null;
+  if (!taskParameterTouched.aspectRatio && (!previous || ["default", "first_frame"].includes(previous.aspectRatioSource))) {
+    taskForm.aspectRatio = selected.aspectRatio;
+    taskAspectFromFrame.value = true;
+  }
+}
+
+function clearTaskSourceImage() {
+  taskLocalImagePath.value = "";
+  taskLocalImageName.value = "";
+  taskAspectFromFrame.value = false;
+}
+
+function markModelChange() {
+  taskParameterTouched.model = true;
+  handleModelChange();
+}
+
+function markAspectChange() {
+  taskParameterTouched.aspectRatio = true;
+  taskAspectFromFrame.value = false;
+}
+
 function restoreTaskDefaults() {
-  const savedAccount = readyAccounts.value.find((account) => account.id === settings.value.lastTaskAccountId);
   taskForm.imageAccountId = "";
-  taskForm.accountId = savedAccount?.id ?? readyAccounts.value[0]?.id ?? "";
+  taskForm.accountId = "";
   taskForm.model = VIDEO_MODEL_OPTIONS.some((model) => model.value === settings.value.lastVideoModel)
     ? settings.value.lastVideoModel
     : DEFAULT_VIDEO_MODEL.value;
@@ -388,22 +476,36 @@ async function importStoryboardTasks() {
   const parsed = importPreview.value.storyboard;
   if (!parsed) return;
   await act(async () => {
-    const inputs: TaskInput[] = parsed.shots.map((shot) => ({
-      projectName: parsed.projectName,
-      shotNumber: shot.shotNumber,
-      firstFrameSource: shot.firstFrameSource,
-      firstFrameFileName: shot.firstFrameImage || importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file?.name || null,
-      sourceImagePath: importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file?.path || null,
-      imagePrompt: shot.imagePrompt,
-      imageAccountId: null,
-      accountId: null,
-      prompt: shot.videoPrompt,
-      model: shot.model,
-      duration: shot.duration,
-      aspectRatio: shot.aspectRatio
-    }));
-    const incomingHasGlobals = Boolean(parsed.globalPrompt || parsed.imageGlobalPrompt || parsed.videoGlobalPrompt);
     const existing = projectStyleByName.value.get(parsed.projectName);
+    const inputs: TaskInput[] = parsed.shots.map((shot) => {
+      const resolvedAsset = importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file;
+      const inferredRatio = resolvedAsset ? inferAspectRatio(resolvedAsset.width, resolvedAsset.height) : shot.aspectRatio;
+      const model = shot.modelExplicit ? shot.model : existing?.lockedModel || shot.model;
+      const aspectRatio = shot.aspectRatioExplicit
+        ? shot.aspectRatio
+        : existing?.lockedAspectRatio || (resolvedAsset ? inferredRatio : shot.aspectRatio);
+      return {
+        projectName: parsed.projectName,
+        shotNumber: shot.shotNumber,
+        shotName: shot.shotName,
+        narration: shot.narration,
+        notes: shot.notes,
+        firstFrameSource: shot.firstFrameSource,
+        firstFrameFileName: shot.firstFrameImage || resolvedAsset?.name || null,
+        sourceImagePath: resolvedAsset?.path || null,
+        imagePrompt: shot.imagePrompt,
+        imageAccountId: null,
+        accountId: null,
+        prompt: shot.videoPrompt,
+        model,
+        modelSource: shot.modelExplicit ? "shot" : existing?.lockedModel ? "project" : "default",
+        duration: shot.duration,
+        durationSource: shot.durationExplicit ? "shot" : "default",
+        aspectRatio,
+        aspectRatioSource: shot.aspectRatioExplicit ? "shot" : existing?.lockedAspectRatio ? "project" : resolvedAsset ? "first_frame" : "default"
+      };
+    });
+    const incomingHasGlobals = Boolean(parsed.globalPrompt || parsed.imageGlobalPrompt || parsed.videoGlobalPrompt);
     if (incomingHasGlobals && (!existing || importGlobalChoice.value === "incoming")) {
       await window.desktopApi.projects.saveStyle({
         projectName: parsed.projectName,
@@ -436,7 +538,7 @@ async function importStoryboardTasks() {
 
 function openProjectStyle(projectName: string) {
   if (!projectName) {
-    flash("请先给项目填写名称，再设置风格锁定", true);
+    flash("请先填写项目名称", true);
     return;
   }
   const existing = projectStyleByName.value.get(projectName);
@@ -556,6 +658,8 @@ async function act(operation: () => Promise<void>) {
     await refreshData();
     await refreshRuntime();
   } catch (error) {
+    await refreshData();
+    await refreshRuntime();
     flash(formatError(error), true);
   }
 }
@@ -649,11 +753,8 @@ function handleModelChange() {
   if (!availableAspectRatios.value.includes(taskForm.aspectRatio)) taskForm.aspectRatio = "9:16";
 }
 
-function handleFirstFrameSourceChange() {
-  if (taskForm.firstFrameSource !== "generated") {
-    taskForm.imagePrompt = "";
-    taskForm.imageAccountId = "";
-  }
+function parameterSourceLabel(source: TaskRecord["modelSource"]) {
+  return ({ shot: "分镜设置", project: "项目锁定", first_frame: "跟随首帧", default: "默认值" })[source];
 }
 </script>
 
@@ -748,60 +849,9 @@ function handleFirstFrameSourceChange() {
       <template v-else-if="activeTab === 'tasks'">
         <section class="task-toolbar">
           <div><p class="eyebrow">STORYBOARD PIPELINE</p><h2>分镜图审核后再进入视频生成</h2></div>
-          <div><button @click="showImportDialog = true">批量导入分镜</button><button class="primary" @click="autoAssignTasks">自动分配账号</button></div>
+          <div><button @click="showImportDialog = true">批量导入分镜</button><button @click="openNewTask">＋ 新增分镜</button><button class="primary" @click="autoAssignTasks">自动分配账号</button></div>
         </section>
-        <section class="task-layout">
-          <form class="panel task-form" @submit.prevent="saveTask">
-            <p class="eyebrow">{{ editingTaskId ? 'EDIT SHOT' : 'NEW SHOT' }}</p><h2>{{ editingTaskId ? '编辑分镜任务' : '保存单个分镜' }}</h2>
-            <div class="project-row">
-              <label>项目 / 视频名称<input v-model="taskForm.projectName" maxlength="80" placeholder="例如：产品宣传片" /></label>
-              <label>分镜编号<input v-model.number="taskForm.shotNumber" type="number" min="1" step="1" required /></label>
-            </div>
-            <button class="inline-style-button" type="button" :disabled="!taskForm.projectName.trim()" @click="openProjectStyle(taskForm.projectName)">设置项目全局约束</button>
-            <div class="stage-block image-stage">
-              <div class="stage-title"><span>1</span><strong>首帧来源</strong><small>三种方式任选一种</small></div>
-              <div class="source-options">
-                <label><input v-model="taskForm.firstFrameSource" type="radio" value="local" @change="handleFirstFrameSourceChange" />本地图片</label>
-                <label><input v-model="taskForm.firstFrameSource" type="radio" value="generated" @change="handleFirstFrameSourceChange" />提示词生成</label>
-                <label><input v-model="taskForm.firstFrameSource" type="radio" value="none" @change="handleFirstFrameSourceChange" />无（纯文生视频）</label>
-              </div>
-              <template v-if="taskForm.firstFrameSource === 'generated'">
-                <label>生图账号<select v-model="taskForm.imageAccountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
-                <label>分镜图提示词<textarea v-model="taskForm.imagePrompt" rows="4" placeholder="描述主体、场景、构图、光线和画面风格…" required></textarea></label>
-              </template>
-              <p v-else-if="taskForm.firstFrameSource === 'local'" class="form-note">保存后在分镜卡片中选择本地图片；批量导入可按文件名自动匹配。</p>
-            </div>
-            <div class="stage-block video-stage">
-              <div class="stage-title"><span>2</span><strong>分镜视频</strong><small>有分镜图时，需审核通过后执行</small></div>
-              <label>视频账号<select v-model="taskForm.accountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
-              <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
-            </div>
-            <div class="form-row">
-              <label class="model-field">模型
-                <select v-model="taskForm.model" @change="handleModelChange">
-                  <option v-for="model in VIDEO_MODEL_OPTIONS" :key="model.value" :value="model.value">{{ model.label }}</option>
-                </select>
-              </label>
-              <label>时长
-                <select v-model.number="taskForm.duration">
-                  <option v-for="duration in availableDurations" :key="duration" :value="duration">{{ durationLabel(duration) }}</option>
-                </select>
-              </label>
-              <label>画幅
-                <select v-model="taskForm.aspectRatio">
-                  <option v-for="aspectRatio in availableAspectRatios" :key="aspectRatio" :value="aspectRatio">{{ aspectRatioLabel(aspectRatio) }}</option>
-                </select>
-              </label>
-            </div>
-            <p class="spec-note">{{ selectedVideoModel.label }} · {{ selectedVideoModel.durationMin }}–{{ selectedVideoModel.durationMax }} 秒 · 支持自动时长与自适应画幅</p>
-            <div class="form-actions">
-              <button v-if="editingTaskId" type="button" @click="cancelTaskEdit">取消编辑</button>
-              <button class="primary" :class="{ wide: !editingTaskId }" type="submit">{{ editingTaskId ? '保存修改' : '保存并继续下一分镜' }}</button>
-            </div>
-            <p class="form-note">点击执行后会打开对应隔离账号并自动填入提示词。模型、时长、画幅、提交按钮以及生成结果目前仍由你在豆包页面确认。</p>
-          </form>
-
-          <section class="panel task-list">
+        <section class="panel task-list">
             <div class="section-heading"><div><p class="eyebrow">LOCAL QUEUE</p><h2>分镜流水线</h2></div><span>{{ tasks.length }} 条</span></div>
             <div v-if="tasks.length" class="task-groups">
               <section v-for="group in taskGroups" :key="group.name" class="task-group">
@@ -814,7 +864,7 @@ function handleFirstFrameSourceChange() {
                 </div>
                 <div class="task-items">
                   <article v-for="task in group.tasks" :key="task.id" class="task-item">
-                    <div><strong>分镜 {{ task.shotNumber }}</strong><small>{{ durationLabel(task.duration) }} · {{ aspectRatioLabel(task.aspectRatio) }}</small></div>
+                    <div><strong>分镜 {{ task.shotNumber }}{{ task.shotName ? ` · ${task.shotName}` : '' }}</strong><small>{{ durationLabel(task.duration) }} · {{ aspectRatioLabel(task.aspectRatio) }}</small></div>
                     <div class="pipeline-row">
                       <div class="pipeline-step" :class="{ done: task.imageStatus === 'approved' || task.imageStatus === 'skipped' }">
                         <span class="badge" :class="task.imageStatus">{{ imageStatusLabel(task.imageStatus) }}</span>
@@ -828,8 +878,19 @@ function handleFirstFrameSourceChange() {
                     </div>
                     <details v-if="task.imagePrompt" class="prompt-detail"><summary>分镜图提示词</summary><p>{{ task.imagePrompt }}</p></details>
                     <details class="prompt-detail"><summary>分镜视频提示词</summary><p>{{ task.prompt }}</p></details>
-                    <p v-if="task.imagePath" class="image-path">已关联：{{ fileName(task.imagePath) }}</p>
-                    <div class="task-meta"><span>{{ task.model }}<template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))"> · 项目风格已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
+                    <details v-if="task.narration" class="prompt-detail narration-detail"><summary>口播 / 旁白（不参与提示词）</summary><p>{{ task.narration }}</p></details>
+                    <details v-if="task.notes" class="prompt-detail"><summary>备注（不参与提示词）</summary><p>{{ task.notes }}</p></details>
+                    <div class="parameter-sources">
+                      <span>模型：{{ task.model }}（{{ parameterSourceLabel(task.modelSource) }}）</span>
+                      <span>时长：{{ durationLabel(task.duration) }}（{{ parameterSourceLabel(task.durationSource) }}）</span>
+                      <span>画幅：{{ aspectRatioLabel(task.aspectRatio) }}（{{ parameterSourceLabel(task.aspectRatioSource) }}）</span>
+                    </div>
+                    <p v-if="task.imagePath" class="image-path" :title="task.imagePath">已关联：{{ task.firstFrameFileName || fileName(task.imagePath) }}</p>
+                    <div v-if="task.errorMessage" class="task-error-card" role="alert">
+                      <strong>视频准备失败</strong>
+                      <span>{{ task.errorMessage }}</span>
+                    </div>
+                    <div class="task-meta"><span><template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))">全局提示词已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
                     <div v-if="task.firstFrameSource !== 'none'" class="card-actions stage-actions">
                       <button v-if="task.firstFrameSource === 'generated'" class="primary small" @click="openImageTask(task)">打开生图页</button>
                       <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记已提交</button>
@@ -853,7 +914,6 @@ function handleFirstFrameSourceChange() {
               </section>
             </div>
             <div v-else class="empty inline"><strong>还没有任务</strong><span>可以保存单个分镜，也可以一次导入整套分镜。</span></div>
-          </section>
         </section>
       </template>
 
@@ -873,6 +933,51 @@ function handleFirstFrameSourceChange() {
     <div v-if="renameAccountTarget" class="modal-backdrop" @click.self="renameAccountTarget = null">
       <form class="modal" @submit.prevent="renameAccount"><p class="eyebrow">LOCAL LABEL</p><h2>修改账号备注</h2><p class="muted">只修改工作台里的本地备注，不会修改豆包昵称。</p><label>本地备注<input v-model="renameAccountLabel" autofocus maxlength="60" required /></label><div class="modal-actions"><button type="button" @click="renameAccountTarget = null">取消</button><button class="primary" type="submit">保存备注</button></div></form>
     </div>
+    <div v-if="showTaskDialog" class="modal-backdrop" @click.self="cancelTaskEdit">
+      <form class="modal task-modal task-form" @submit.prevent="saveTask">
+        <p class="eyebrow">{{ editingTaskId ? 'EDIT SHOT' : 'NEW SHOT' }}</p><h2>{{ editingTaskId ? '编辑分镜' : '新增分镜' }}</h2>
+        <div class="project-row">
+          <label>项目 / 视频名称<input v-model="taskForm.projectName" maxlength="80" placeholder="例如：宠物冒险短片" /></label>
+          <label>分镜编号<input v-model.number="taskForm.shotNumber" type="number" min="1" step="1" required /></label>
+        </div>
+        <label>镜头名（选填）<input v-model="taskForm.shotName" maxlength="80" placeholder="例如：小狗回头" /></label>
+        <button class="inline-style-button" type="button" @click="openProjectStyle(taskForm.projectName)">设置项目全局约束</button>
+        <p v-if="!taskForm.projectName.trim()" class="form-warning">请先填写项目名称</p>
+
+        <div class="stage-block image-stage">
+          <div class="stage-title"><span>1</span><strong>首帧（可选）</strong><small>系统根据填写内容自动判断来源</small></div>
+          <div class="source-input-grid">
+            <div class="source-picker">
+              <strong>首帧图（上传本地图）</strong>
+              <span>{{ taskLocalImageName || '未选择；留空也可以' }}</span>
+              <div><button type="button" @click="chooseTaskSourceImage">选择图片</button><button v-if="taskLocalImagePath" type="button" @click="clearTaskSourceImage">清除</button></div>
+            </div>
+            <div>
+              <label>分镜图提示词（让豆包生成）<textarea v-model="taskForm.imagePrompt" rows="4" placeholder="描述主体、场景、构图、光线和画面风格…"></textarea></label>
+              <label v-if="taskForm.imagePrompt.trim()">生图账号<select v-model="taskForm.imageAccountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
+            </div>
+          </div>
+          <p v-if="taskLocalImagePath && taskForm.imagePrompt.trim()" class="form-error">首帧图和分镜图提示词只能保留一个。</p>
+          <p v-else class="form-note">有本地图 = 本地首帧；有提示词 = 豆包生成首帧；两项都空 = 纯文生视频。</p>
+        </div>
+
+        <div class="stage-block video-stage">
+          <div class="stage-title"><span>2</span><strong>分镜视频</strong><small>最终生成按钮仍由你手动点击</small></div>
+          <label>视频账号<select v-model="taskForm.accountId"><option value="">稍后自动分配</option><option v-for="account in readyAccounts" :key="account.id" :value="account.id">{{ account.label }}</option></select></label>
+          <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
+          <label>口播 / 旁白（选填，不参与提示词）<textarea v-model="taskForm.narration" rows="2" placeholder="后续可用于字幕或配音稿"></textarea></label>
+          <label>备注（选填，不参与提示词）<textarea v-model="taskForm.notes" rows="2"></textarea></label>
+        </div>
+
+        <div class="form-row">
+          <label class="model-field">模型<select v-model="taskForm.model" @change="markModelChange"><option v-for="model in VIDEO_MODEL_OPTIONS" :key="model.value" :value="model.value">{{ model.label }}</option></select></label>
+          <label>时长<select v-model.number="taskForm.duration" @change="taskParameterTouched.duration = true"><option v-for="duration in availableDurations" :key="duration" :value="duration">{{ durationLabel(duration) }}</option></select></label>
+          <label>画幅<select v-model="taskForm.aspectRatio" @change="markAspectChange"><option v-for="aspectRatio in availableAspectRatios" :key="aspectRatio" :value="aspectRatio">{{ aspectRatioLabel(aspectRatio) }}</option></select></label>
+        </div>
+        <p class="spec-note">{{ selectedVideoModel.label }} · {{ selectedVideoModel.durationMin }}–{{ selectedVideoModel.durationMax }} 秒 · 支持自动画幅</p>
+        <div class="modal-actions"><button type="button" @click="cancelTaskEdit">取消</button><button class="primary" type="submit" :disabled="Boolean(taskLocalImagePath && taskForm.imagePrompt.trim())">{{ editingTaskId ? '保存修改' : '保存分镜' }}</button></div>
+      </form>
+    </div>
     <div v-if="showImportDialog" class="modal-backdrop" @click.self="showImportDialog = false">
       <form class="modal import-modal" @submit.prevent="importStoryboardTasks">
         <p class="eyebrow">BATCH STORYBOARD</p><h2>批量导入整套分镜</h2>
@@ -881,6 +986,10 @@ function handleFirstFrameSourceChange() {
         <label>分镜内容<textarea v-model="importText" rows="12" placeholder="项目名称：柯基短片&#10;全局提示词：吉卜力风格…&#10;### 分镜 1&#10;首帧来源：本地图片&#10;首帧图：01.png&#10;视频提示词：……&#10;时长：10秒&#10;画幅：9:16"></textarea></label>
         <div v-if="importPreview.storyboard" class="import-result success">识别到 {{ importPreview.storyboard.shots.length }} 个分镜 · 项目：{{ importPreview.storyboard.projectName }}</div>
         <div v-else-if="importPreview.error" class="import-result error">{{ importPreview.error }}</div>
+        <div v-if="importPreview.storyboard?.warnings.length" class="import-warning-list">
+          <strong>发现 {{ importPreview.storyboard.warnings.length }} 个疑似字段（原文已保留）</strong>
+          <span v-for="warning in importPreview.storyboard.warnings" :key="`${warning.lineNumber}-${warning.label}`">{{ warning.message }}</span>
+        </div>
         <template v-if="importPreview.storyboard?.shots.some(shot => shot.firstFrameSource === 'local')">
           <div class="asset-folder-row"><div><strong>本地首帧素材</strong><span>{{ importAssets.folderPath || '尚未选择文件夹；绝对路径可直接识别' }}</span></div><button type="button" @click="chooseImportAssetFolder">选择素材文件夹</button></div>
           <div v-if="importAssetResolution" class="asset-preview-list">

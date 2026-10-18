@@ -1,17 +1,23 @@
 import { describe, expect, it } from "vitest";
 import type { AssetFolderFile } from "../electron/contracts";
-import { resolveStoryboardAssets } from "../src/storyboard-assets";
+import { inferAspectRatio, resolveStoryboardAssets } from "../src/storyboard-assets";
 import type { ImportedShot } from "../src/storyboard-import";
 
 const shot = (shotNumber: number, firstFrameImage = "", aspectRatio = "9:16"): ImportedShot => ({
   shotNumber,
+  shotName: "",
+  narration: "",
+  notes: "",
   firstFrameSource: "local",
   firstFrameImage,
   imagePrompt: "",
   videoPrompt: "测试",
   model: "Seedance 2.0 mini",
+  modelExplicit: false,
   duration: 10,
-  aspectRatio
+  durationExplicit: false,
+  aspectRatio,
+  aspectRatioExplicit: false
 });
 
 const file = (name: string, width = 900, height = 1600): AssetFolderFile => ({
@@ -35,5 +41,21 @@ describe("storyboard asset matching", () => {
     expect(result.shots[0].error).toMatch(/多张/);
     expect(result.shots[1].error).toMatch(/未找到/);
     expect(result.unusedFiles).toHaveLength(3);
+  });
+
+  it("infers the nearest Doubao ratio from a first frame", () => {
+    expect(inferAspectRatio(1080, 1920)).toBe("9:16");
+    expect(inferAspectRatio(1600, 900)).toBe("16:9");
+    expect(inferAspectRatio(1000, 1000)).toBe("1:1");
+  });
+
+  it("uses the inferred first-frame ratio in import preview when ratio is not explicit", () => {
+    const inferred = resolveStoryboardAssets([shot(1, "wide.png")], [file("wide.png", 1600, 900)]);
+    expect(inferred.shots[0].warning).toBe("");
+
+    const explicit = shot(1, "wide.png", "9:16");
+    explicit.aspectRatioExplicit = true;
+    const mismatched = resolveStoryboardAssets([explicit], [file("wide.png", 1600, 900)]);
+    expect(mismatched.shots[0].warning).toMatch(/9:16/);
   });
 });

@@ -68,4 +68,43 @@ describe("storyboard import", () => {
   it("rejects shots without a video prompt", () => {
     expect(() => parseStoryboard("### 分镜 1\n分镜图提示词：只有图片")).toThrow(/缺少视频提示词/);
   });
+
+  it("keeps body labels inside prompts without noisy warnings", () => {
+    const result = parseStoryboard(`
+全局视频提示词：保持统一风格
+禁止：文字和水印
+### 分镜 1
+镜头名：小狗回头
+视频提示词：小狗向镜头回头
+0–3秒：缓慢转头
+镜头：轻微推进
+口播：今天也要开心
+备注：后期加环境音
+`);
+    expect(result.videoGlobalPrompt).toContain("禁止：文字和水印");
+    expect(result.shots[0].videoPrompt).toContain("0–3秒：缓慢转头\n镜头：轻微推进");
+    expect(result.shots[0]).toMatchObject({ shotName: "小狗回头", narration: "今天也要开心", notes: "后期加环境音" });
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("warns only for field-like typos and aggregates once per shot", () => {
+    const result = parseStoryboard(`
+### 分镜 1
+视频提示词：小狗向镜头回头
+首帧：01.png
+画面比例：16:9
+动作：缓慢转头
+### 分镜 2
+视频提示词：小猫跳上沙发
+光线：午后暖光
+`);
+    expect(result.shots[0].videoPrompt).toContain("首帧：01.png\n画面比例：16:9\n动作：缓慢转头");
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toMatchObject({ shotNumber: 1, label: "首帧、画面比例" });
+  });
+
+  it("records whether model, duration and ratio came from a shot", () => {
+    const result = parseStoryboard("### 分镜 1\n视频提示词：测试\n画幅：自动");
+    expect(result.shots[0]).toMatchObject({ modelExplicit: false, durationExplicit: false, aspectRatioExplicit: true, aspectRatio: "adaptive" });
+  });
 });

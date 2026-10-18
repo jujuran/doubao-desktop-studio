@@ -13,7 +13,7 @@ export const VIDEO_MODEL_OPTIONS: readonly VideoModelOption[] = [
     label: "Seedance 2.5",
     durationMin: 4,
     durationMax: 30,
-    supportsAdaptiveDuration: true,
+    supportsAdaptiveDuration: false,
     aspectRatios: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
   },
   {
@@ -21,7 +21,7 @@ export const VIDEO_MODEL_OPTIONS: readonly VideoModelOption[] = [
     label: "Seedance 2.0",
     durationMin: 4,
     durationMax: 15,
-    supportsAdaptiveDuration: true,
+    supportsAdaptiveDuration: false,
     aspectRatios: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
   },
   {
@@ -29,7 +29,7 @@ export const VIDEO_MODEL_OPTIONS: readonly VideoModelOption[] = [
     label: "Seedance 2.0 fast",
     durationMin: 4,
     durationMax: 15,
-    supportsAdaptiveDuration: true,
+    supportsAdaptiveDuration: false,
     aspectRatios: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
   },
   {
@@ -37,7 +37,7 @@ export const VIDEO_MODEL_OPTIONS: readonly VideoModelOption[] = [
     label: "Seedance 2.0 mini",
     durationMin: 4,
     durationMax: 15,
-    supportsAdaptiveDuration: true,
+    supportsAdaptiveDuration: false,
     aspectRatios: ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
   }
 ];

@@ -49,6 +49,9 @@ export class StudioDatabase {
         id TEXT PRIMARY KEY,
         project_name TEXT NOT NULL DEFAULT '',
         shot_number INTEGER NOT NULL DEFAULT 1,
+        shot_name TEXT NOT NULL DEFAULT '',
+        narration TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
         first_frame_source TEXT NOT NULL DEFAULT 'none',
         first_frame_file_name TEXT,
         image_prompt TEXT NOT NULL DEFAULT '',
@@ -58,8 +61,11 @@ export class StudioDatabase {
         account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
         prompt TEXT NOT NULL,
         model TEXT NOT NULL,
+        model_source TEXT NOT NULL DEFAULT 'shot',
         duration INTEGER NOT NULL,
+        duration_source TEXT NOT NULL DEFAULT 'shot',
         aspect_ratio TEXT NOT NULL,
+        aspect_ratio_source TEXT NOT NULL DEFAULT 'shot',
         status TEXT NOT NULL,
         result_url TEXT,
         result_path TEXT,
@@ -107,6 +113,12 @@ export class StudioDatabase {
     if (!taskColumns.has("shot_number")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN shot_number INTEGER NOT NULL DEFAULT 1");
     }
+    if (!taskColumns.has("shot_name")) this.db.exec("ALTER TABLE tasks ADD COLUMN shot_name TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("narration")) this.db.exec("ALTER TABLE tasks ADD COLUMN narration TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("notes")) this.db.exec("ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("model_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN model_source TEXT NOT NULL DEFAULT 'shot'");
+    if (!taskColumns.has("duration_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN duration_source TEXT NOT NULL DEFAULT 'shot'");
+    if (!taskColumns.has("aspect_ratio_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN aspect_ratio_source TEXT NOT NULL DEFAULT 'shot'");
     if (!taskColumns.has("first_frame_source")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN first_frame_source TEXT NOT NULL DEFAULT 'none'");
     }
@@ -229,15 +241,18 @@ export class StudioDatabase {
     const imageStatus = initialImageStatus(normalized.firstFrameSource, imagePath);
     this.db.prepare(`
       INSERT INTO tasks(
-        id, project_name, shot_number, first_frame_source, first_frame_file_name,
+        id, project_name, shot_number, shot_name, narration, notes, first_frame_source, first_frame_file_name,
         image_prompt, image_account_id, image_status, image_path,
-        account_id, prompt, model, duration, aspect_ratio, status, created_at, updated_at
+        account_id, prompt, model, model_source, duration, duration_source, aspect_ratio, aspect_ratio_source, status, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
     `).run(
       id,
       normalized.projectName,
       normalized.shotNumber,
+      normalized.shotName ?? "",
+      normalized.narration ?? "",
+      normalized.notes ?? "",
       normalized.firstFrameSource,
       normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
@@ -247,8 +262,11 @@ export class StudioDatabase {
       normalized.accountId,
       normalized.prompt,
       normalized.model,
+      normalized.modelSource ?? "shot",
       normalized.duration,
+      normalized.durationSource ?? "shot",
       normalized.aspectRatio,
+      normalized.aspectRatioSource ?? "shot",
       createdAt,
       createdAt
     );
@@ -288,13 +306,16 @@ export class StudioDatabase {
           : previous.imageStatus;
     this.db.prepare(`
       UPDATE tasks
-      SET project_name = ?, shot_number = ?, first_frame_source = ?, first_frame_file_name = ?,
+      SET project_name = ?, shot_number = ?, shot_name = ?, narration = ?, notes = ?, first_frame_source = ?, first_frame_file_name = ?,
           image_prompt = ?, image_account_id = ?, image_status = ?, image_path = ?,
-          account_id = ?, prompt = ?, model = ?, duration = ?, aspect_ratio = ?, updated_at = ?
+          account_id = ?, prompt = ?, model = ?, model_source = ?, duration = ?, duration_source = ?, aspect_ratio = ?, aspect_ratio_source = ?, updated_at = ?
       WHERE id = ?
     `).run(
       normalized.projectName,
       normalized.shotNumber,
+      normalized.shotName ?? "",
+      normalized.narration ?? "",
+      normalized.notes ?? "",
       normalized.firstFrameSource,
       normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
@@ -304,8 +325,11 @@ export class StudioDatabase {
       normalized.accountId,
       normalized.prompt,
       normalized.model,
+      normalized.modelSource ?? "shot",
       normalized.duration,
+      normalized.durationSource ?? "shot",
       normalized.aspectRatio,
+      normalized.aspectRatioSource ?? "shot",
       now(),
       id
     );
@@ -317,6 +341,9 @@ export class StudioDatabase {
     return this.createTask({
       projectName: source.projectName,
       shotNumber: source.shotNumber + 1,
+      shotName: source.shotName,
+      narration: source.narration,
+      notes: source.notes,
       firstFrameSource: source.firstFrameSource,
       firstFrameFileName: source.firstFrameFileName,
       sourceImagePath: source.imagePath,
@@ -325,8 +352,11 @@ export class StudioDatabase {
       accountId: source.accountId,
       prompt: source.prompt,
       model: source.model,
+      modelSource: source.modelSource,
       duration: source.duration,
-      aspectRatio: source.aspectRatio
+      durationSource: source.durationSource,
+      aspectRatio: source.aspectRatio,
+      aspectRatioSource: source.aspectRatioSource
     });
   }
 
@@ -359,15 +389,23 @@ export class StudioDatabase {
     return this.getTask(id);
   }
 
-  setTaskImage(id: string, imagePath: string): TaskRecord {
+  setTaskImage(id: string, imagePath: string, inferredAspectRatio?: string): TaskRecord {
     const previous = this.getTask(id);
     const managedPath = this.storeManagedImage(imagePath);
     const source: FirstFrameSource = previous.firstFrameSource === "none" ? "local" : previous.firstFrameSource;
+    const followFirstFrame = Boolean(inferredAspectRatio && ["default", "first_frame"].includes(previous.aspectRatioSource));
+    const nextAspectRatio = followFirstFrame && inferredAspectRatio ? inferredAspectRatio : previous.aspectRatio;
     this.db.prepare(`
       UPDATE tasks
-      SET first_frame_source = ?, first_frame_file_name = ?, image_path = ?, image_status = 'approved', updated_at = ?
+      SET first_frame_source = ?, first_frame_file_name = ?, image_path = ?, image_status = 'approved',
+          aspect_ratio = ?, aspect_ratio_source = ?, updated_at = ?
       WHERE id = ?
-    `).run(source, path.basename(imagePath), managedPath, now(), id);
+    `).run(
+      source, path.basename(imagePath), managedPath,
+      nextAspectRatio,
+      followFirstFrame ? "first_frame" : previous.aspectRatioSource,
+      now(), id
+    );
     return this.getTask(id);
   }
 
@@ -490,17 +528,29 @@ export class StudioDatabase {
     if (!profile) throw new Error("项目尚未保存风格锁定");
     const result = this.db.prepare(`
       UPDATE tasks
-      SET model = COALESCE(?, model),
-          aspect_ratio = COALESCE(?, aspect_ratio),
+      SET model = CASE WHEN ? IS NOT NULL AND model_source != 'shot' THEN ? ELSE model END,
+          model_source = CASE WHEN ? IS NOT NULL AND model_source != 'shot' THEN 'project' ELSE model_source END,
+          aspect_ratio = CASE WHEN ? IS NOT NULL AND aspect_ratio_source != 'shot' THEN ? ELSE aspect_ratio END,
+          aspect_ratio_source = CASE WHEN ? IS NOT NULL AND aspect_ratio_source != 'shot' THEN 'project' ELSE aspect_ratio_source END,
           duration = CASE
-            WHEN ? IS NOT NULL AND ? != 'Seedance 2.5' AND duration > 15 THEN 15
+            WHEN ? IS NOT NULL AND ? != 'Seedance 2.5' AND model_source != 'shot' AND duration > 15 THEN 15
             ELSE duration
+          END,
+          duration_source = CASE
+            WHEN ? IS NOT NULL AND ? != 'Seedance 2.5' AND model_source != 'shot' AND duration > 15 THEN 'project'
+            ELSE duration_source
           END,
           updated_at = ?
       WHERE project_name = ?
     `).run(
       profile.lockedModel,
+      profile.lockedModel,
+      profile.lockedModel,
       profile.lockedAspectRatio,
+      profile.lockedAspectRatio,
+      profile.lockedAspectRatio,
+      profile.lockedModel,
+      profile.lockedModel,
       profile.lockedModel,
       profile.lockedModel,
       now(),
@@ -568,6 +618,12 @@ export class StudioDatabase {
       ...input,
       projectName: input.projectName.trim(),
       shotNumber: Math.max(1, Math.round(Number(input.shotNumber) || 1)),
+      shotName: input.shotName?.trim() || "",
+      narration: input.narration?.trim() || "",
+      notes: input.notes?.trim() || "",
+      modelSource: input.modelSource ?? "shot",
+      durationSource: input.durationSource ?? "shot",
+      aspectRatioSource: input.aspectRatioSource ?? "shot",
       firstFrameSource,
       firstFrameFileName: input.firstFrameFileName?.trim() || null,
       sourceImagePath: input.sourceImagePath || null,
@@ -679,6 +735,9 @@ function rowToTask(row: DbRow): TaskRecord {
     id: String(row.id),
     projectName: row.project_name ? String(row.project_name) : "",
     shotNumber: Math.max(1, Number(row.shot_number) || 1),
+    shotName: String(row.shot_name || ""),
+    narration: String(row.narration || ""),
+    notes: String(row.notes || ""),
     firstFrameSource: String(row.first_frame_source || (row.image_prompt ? "generated" : row.image_path ? "local" : "none")) as FirstFrameSource,
     firstFrameFileName: row.first_frame_file_name ? String(row.first_frame_file_name) : null,
     imagePrompt: row.image_prompt ? String(row.image_prompt) : "",
@@ -688,8 +747,11 @@ function rowToTask(row: DbRow): TaskRecord {
     accountId: row.account_id ? String(row.account_id) : null,
     prompt: String(row.prompt),
     model: String(row.model),
+    modelSource: String(row.model_source || "shot") as TaskRecord["modelSource"],
     duration: Number(row.duration),
+    durationSource: String(row.duration_source || "shot") as TaskRecord["durationSource"],
     aspectRatio: String(row.aspect_ratio),
+    aspectRatioSource: String(row.aspect_ratio_source || "shot") as TaskRecord["aspectRatioSource"],
     status: String(row.status) as TaskStatus,
     resultUrl: row.result_url ? String(row.result_url) : null,
     resultPath: row.result_path ? String(row.result_path) : null,
