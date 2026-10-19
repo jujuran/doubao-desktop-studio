@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AssetFolderFile } from "../electron/contracts";
-import { inferAspectRatio, resolveStoryboardAssets } from "../src/storyboard-assets";
+import { inferAspectRatio, resolveProjectReferenceAssets, resolveStoryboardAssets } from "../src/storyboard-assets";
 import type { ImportedShot } from "../src/storyboard-import";
 
 const shot = (shotNumber: number, firstFrameImage = "", aspectRatio = "9:16"): ImportedShot => ({
@@ -8,6 +8,7 @@ const shot = (shotNumber: number, firstFrameImage = "", aspectRatio = "9:16"): I
   shotName: "",
   narration: "",
   notes: "",
+  generationCount: 1,
   firstFrameSource: "local",
   firstFrameImage,
   imagePrompt: "",
@@ -57,5 +58,24 @@ describe("storyboard asset matching", () => {
     explicit.aspectRatioExplicit = true;
     const mismatched = resolveStoryboardAssets([explicit], [file("wide.png", 1600, 900)]);
     expect(mismatched.shots[0].warning).toMatch(/9:16/);
+  });
+
+  it("resolves project character references from the same asset folder", () => {
+    const result = resolveProjectReferenceAssets(
+      ["front.png", "side.png"],
+      [file("front.png"), file("other.png")]
+    );
+    expect(result.files.map((item) => item.name)).toEqual(["front.png"]);
+    expect(result.missing).toEqual(["side.png"]);
+    expect(result.hasErrors).toBe(true);
+  });
+
+  it("uses the same exact filename lookup for first frames and character references", () => {
+    const assets = [file("正面照.png", 1600, 900)];
+    const frame = resolveStoryboardAssets([shot(1, "正面照.png")], assets);
+    const references = resolveProjectReferenceAssets(["正面照.png"], assets);
+    expect(frame.shots[0].file?.path).toBe(assets[0].path);
+    expect(references.files[0].path).toBe(assets[0].path);
+    expect(references.missing).toEqual([]);
   });
 });

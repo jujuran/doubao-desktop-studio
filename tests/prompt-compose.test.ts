@@ -8,7 +8,8 @@ const profile: ProjectStyleProfile = {
   imageGlobalPrompt: "保持角色与客厅布局一致",
   videoGlobalPrompt: "延续上一镜光线方向，禁止换装和文字水印",
   migrationPending: false,
-  characterReferencePath: "C:\\refs\\character.png",
+  characterReferencePaths: ["C:\\refs\\character.png"],
+  characterReferenceHashes: ["hash-character"],
   sceneReferencePath: null,
   styleReferencePath: "C:\\refs\\style.png",
   lockedModel: "Seedance 2.0 mini",
@@ -21,8 +22,8 @@ describe("project prompt composition", () => {
     const prompt = composeProjectPrompt("video", "人物缓慢转头", profile);
     expect(prompt).toContain("【全局视频提示词】\n延续上一镜光线方向");
     expect(prompt).toContain("【本分镜视频】\n人物缓慢转头");
-    expect(prompt).toContain("角色定妆图");
-    expect(prompt).toContain("风格参考图");
+    expect(prompt).not.toContain("角色定妆图");
+    expect(prompt).not.toContain("风格参考图");
     expect(prompt.indexOf("【全局视频提示词】")).toBeLessThan(prompt.indexOf("【本分镜视频】"));
   });
 
@@ -37,6 +38,7 @@ describe("project prompt composition", () => {
     expect(prompt).not.toContain("【");
     expect(prompt).toContain("延续上一镜光线方向");
     expect(prompt).toContain("人物缓慢转头");
+    expect(prompt).not.toContain("严格保持角色");
   });
 
   it("keeps migrated legacy drafts inactive until they are confirmed", () => {

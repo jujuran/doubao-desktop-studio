@@ -15,9 +15,9 @@ import type {
   TaskStatus
 } from "../electron/contracts";
 import appIcon from "./assets/app-icon.png";
-import { parseStoryboard } from "./storyboard-import";
-import { inferAspectRatio, resolveStoryboardAssets } from "./storyboard-assets";
-import { composeProjectPrompt, hasProjectStyle } from "./prompt-compose";
+import { parseStoryboard, type ImportedShot } from "./storyboard-import";
+import { inferAspectRatio, resolveProjectReferenceAssets, resolveStoryboardAssets } from "./storyboard-assets";
+import { composeDeliveryPrompt, composeProjectPrompt, hasProjectStyle, projectStagePrompt, type PromptStage } from "./prompt-compose";
 import {
   aspectRatioLabel,
   DEFAULT_VIDEO_MODEL,
@@ -36,6 +36,7 @@ const projectStyles = ref<ProjectStyleProfile[]>([]);
 const settings = ref<AppSettings>({
   maxActiveWorkers: 2,
   automationEnabled: false,
+  autoClickGenerate: false,
   lastTaskAccountId: null,
   lastVideoModel: DEFAULT_VIDEO_MODEL.value,
   lastVideoDuration: 10,
@@ -77,9 +78,13 @@ const styleForm = reactive<ProjectStyleInput>({
   imageGlobalPrompt: "",
   videoGlobalPrompt: "",
   migrationPending: false,
-  characterReferencePath: null,
+  characterReferencePaths: [],
+  characterReferenceNames: [],
   sceneReferencePath: null,
+  sceneReferenceName: null,
   styleReferencePath: null,
+  styleReferenceName: null,
+  outputDirectory: null,
   lockedModel: null,
   lockedAspectRatio: null
 });
@@ -89,6 +94,7 @@ const taskForm = reactive({
   shotName: "",
   narration: "",
   notes: "",
+  generationCount: 1,
   imagePrompt: "",
   imageAccountId: "",
   accountId: "",
@@ -104,7 +110,15 @@ const activeTasks = computed(() => tasks.value.filter((task) => task.status === 
 const accountById = computed(() => new Map(accounts.value.map((account) => [account.id, account])));
 const usageByAccount = computed(() => new Map(usage.value.map((item) => [item.accountId, item])));
 const projectStyleByName = computed(() => new Map(projectStyles.value.map((profile) => [profile.projectName, profile])));
-const stylePreviewProfile = computed<ProjectStyleProfile>(() => ({ ...styleForm, updatedAt: "" }));
+const stylePreviewProfile = computed<ProjectStyleProfile>(() => ({
+  ...styleForm,
+  characterReferenceNames: styleForm.characterReferenceNames ?? [],
+  sceneReferenceName: styleForm.sceneReferenceName ?? null,
+  styleReferenceName: styleForm.styleReferenceName ?? null,
+  outputDirectory: styleForm.outputDirectory ?? null,
+  characterReferenceHashes: [],
+  updatedAt: ""
+}));
 const stylePreviewTask = computed(() => tasks.value.find((task) => task.projectName === styleForm.projectName) ?? null);
 const styleImagePreview = computed(() => composeProjectPrompt(
   "image",
@@ -128,6 +142,10 @@ const importAssetResolution = computed(() => importPreview.value.storyboard
   ? resolveStoryboardAssets(importPreview.value.storyboard.shots, importAssets.value.files)
   : null
 );
+const importCharacterReferenceResolution = computed(() => importPreview.value.storyboard
+  ? resolveProjectReferenceAssets(importPreview.value.storyboard.characterReferenceImages, importAssets.value.files)
+  : null
+);
 const importGlobalConflict = computed(() => {
   const storyboard = importPreview.value.storyboard;
   if (!storyboard) return false;
@@ -137,7 +155,40 @@ const importGlobalConflict = computed(() => {
   const saved = [existing.globalPrompt, existing.imageGlobalPrompt, existing.videoGlobalPrompt].join("\n").trim();
   return Boolean(incoming && incoming !== saved);
 });
-const canImportStoryboard = computed(() => Boolean(importPreview.value.storyboard && !importAssetResolution.value?.hasErrors));
+const importPromptProfile = computed<ProjectStyleProfile | null>(() => {
+  const storyboard = importPreview.value.storyboard;
+  if (!storyboard) return null;
+  const existing = projectStyleByName.value.get(storyboard.projectName) ?? null;
+  const incomingHasGlobals = Boolean(storyboard.globalPrompt || storyboard.imageGlobalPrompt || storyboard.videoGlobalPrompt);
+  if (existing && !incomingHasGlobals) return existing;
+  if (existing && importGlobalConflict.value && importGlobalChoice.value === "existing") return existing;
+  return {
+    projectName: storyboard.projectName,
+    globalPrompt: storyboard.globalPrompt,
+    imageGlobalPrompt: storyboard.imageGlobalPrompt,
+    videoGlobalPrompt: storyboard.videoGlobalPrompt,
+    migrationPending: false,
+    characterReferencePaths: importCharacterReferenceResolution.value?.files.map((file) => file.path) ?? existing?.characterReferencePaths ?? [],
+    characterReferenceHashes: [],
+    characterReferenceNames: importCharacterReferenceResolution.value?.files.map((file) => file.name) ?? existing?.characterReferenceNames ?? [],
+    sceneReferencePath: existing?.sceneReferencePath ?? null,
+    sceneReferenceName: existing?.sceneReferenceName ?? null,
+    styleReferencePath: existing?.styleReferencePath ?? null,
+    styleReferenceName: existing?.styleReferenceName ?? null,
+    outputDirectory: existing?.outputDirectory ?? importAssets.value.folderPath ?? null,
+    lockedModel: existing?.lockedModel ?? null,
+    lockedAspectRatio: existing?.lockedAspectRatio ?? null,
+    updatedAt: ""
+  };
+});
+const canImportStoryboard = computed(() => Boolean(
+  importPreview.value.storyboard
+  && !importAssetResolution.value?.hasErrors
+));
+const importUnusedFiles = computed(() => {
+  const referencePaths = new Set(importCharacterReferenceResolution.value?.files.map((file) => file.path) ?? []);
+  return (importAssetResolution.value?.unusedFiles ?? []).filter((file) => !referencePaths.has(file.path));
+});
 const selectedVideoModel = computed(
   () => VIDEO_MODEL_OPTIONS.find((model) => model.value === taskForm.model) ?? DEFAULT_VIDEO_MODEL
 );
@@ -294,6 +345,7 @@ async function saveTask() {
       shotName: taskForm.shotName,
       narration: taskForm.narration,
       notes: taskForm.notes,
+      generationCount: Number(taskForm.generationCount),
       firstFrameSource,
       firstFrameFileName: firstFrameSource === "local"
         ? taskLocalImageName.value || previous?.firstFrameFileName || null
@@ -334,6 +386,7 @@ async function saveTask() {
     taskForm.shotName = "";
     taskForm.narration = "";
     taskForm.notes = "";
+    taskForm.generationCount = 1;
     taskForm.prompt = "";
     if (!wasEditing) taskForm.shotNumber += 1;
     flash(wasEditing ? "任务修改已保存" : "任务已保存，可继续填写下一分镜");
@@ -347,6 +400,7 @@ function editTask(task: TaskRecord) {
   taskForm.shotName = task.shotName;
   taskForm.narration = task.narration;
   taskForm.notes = task.notes;
+  taskForm.generationCount = task.generationCount;
   taskLocalImagePath.value = task.firstFrameSource === "local" ? task.imagePath || "" : "";
   taskLocalImageName.value = task.firstFrameSource === "local" ? task.firstFrameFileName || fileName(task.imagePath) : "";
   taskForm.imagePrompt = task.imagePrompt;
@@ -369,6 +423,7 @@ function cancelTaskEdit() {
   taskForm.shotName = "";
   taskForm.narration = "";
   taskForm.notes = "";
+  taskForm.generationCount = 1;
   taskForm.prompt = "";
   taskLocalImagePath.value = "";
   taskLocalImageName.value = "";
@@ -382,6 +437,7 @@ function openNewTask() {
   taskForm.shotName = "";
   taskForm.narration = "";
   taskForm.notes = "";
+  taskForm.generationCount = 1;
   taskForm.imagePrompt = "";
   taskForm.prompt = "";
   taskLocalImagePath.value = "";
@@ -439,7 +495,7 @@ async function openTask(task: TaskRecord) {
     await window.desktopApi.tasks.open(task.id);
     const frameNote = task.firstFrameSource === "none" ? "" : "，已自动上传锁定首帧";
     const referenceNote = projectHasReferences(task.projectName) ? "；项目参考图目前仍需手动上传" : "";
-    flash(`已打开豆包视频页并自动填入合成提示词${frameNote}${referenceNote}，确认参数后提交`);
+    flash(`已打开豆包视频页并自动填入合成提示词${frameNote}${referenceNote}${settings.value.autoClickGenerate ? '，核对通过后已自动点击生成' : '，请确认后点击生成'}`);
   });
 }
 
@@ -447,7 +503,7 @@ async function openImageTask(task: TaskRecord) {
   await act(async () => {
     await window.desktopApi.tasks.openImage(task.id);
     const referenceNote = projectHasReferences(task.projectName) ? "；请手动上传项目参考图" : "";
-    flash(`已打开豆包生图页并自动填入合成提示词${referenceNote}，确认后提交`);
+    flash(`已打开豆包生图页并自动填入合成提示词${referenceNote}${settings.value.autoClickGenerate ? '，核对通过后已自动点击生成' : '，请确认后点击生成'}`);
   });
 }
 
@@ -463,6 +519,38 @@ async function updateImageTask(task: TaskRecord, status: ImageTaskStatus) {
     await window.desktopApi.tasks.updateImageStatus(task.id, status);
     flash(status === "approved" ? "分镜图已通过审核，可以进入视频阶段" : "分镜图状态已更新");
   });
+}
+
+async function approveImageCandidate(candidateId: string) {
+  await act(async () => {
+    await window.desktopApi.tasks.approveImageCandidate(candidateId);
+    flash(settings.value.autoClickGenerate ? "首帧已锁定，已自动衔接视频生成" : "候选图已审核通过并锁定为首帧");
+  });
+}
+
+async function reviewVideoCandidate(candidateId: string, approved: boolean) {
+  await act(async () => {
+    await window.desktopApi.tasks.reviewVideoCandidate(candidateId, approved);
+    flash(approved ? "视频已审核通过" : "视频已移入作废文件夹，可重新生成");
+  });
+}
+
+async function recheckVideoDownload(task: TaskRecord) {
+  await act(async () => {
+    await window.desktopApi.tasks.recheckDownload(task.id);
+    flash("已重新检查豆包并下载最新原视频");
+  });
+}
+
+async function importVideoCandidate(task: TaskRecord) {
+  await act(async () => {
+    const imported = await window.desktopApi.tasks.importVideoCandidate(task.id);
+    if (imported) flash("视频已导入为待审核候选");
+  });
+}
+
+async function openCandidateFolder(candidateId: string) {
+  await window.desktopApi.tasks.openCandidateFolder(candidateId);
 }
 
 async function autoAssignTasks() {
@@ -490,6 +578,7 @@ async function importStoryboardTasks() {
         shotName: shot.shotName,
         narration: shot.narration,
         notes: shot.notes,
+        generationCount: shot.generationCount,
         firstFrameSource: shot.firstFrameSource,
         firstFrameFileName: shot.firstFrameImage || resolvedAsset?.name || null,
         sourceImagePath: resolvedAsset?.path || null,
@@ -506,16 +595,24 @@ async function importStoryboardTasks() {
       };
     });
     const incomingHasGlobals = Boolean(parsed.globalPrompt || parsed.imageGlobalPrompt || parsed.videoGlobalPrompt);
-    if (incomingHasGlobals && (!existing || importGlobalChoice.value === "incoming")) {
+    const incomingReferencePaths = importCharacterReferenceResolution.value?.files.map((file) => file.path) ?? [];
+    const useIncomingGlobals = incomingHasGlobals && (!existing || importGlobalChoice.value === "incoming");
+    if (useIncomingGlobals || incomingReferencePaths.length || (!existing && importAssets.value.folderPath)) {
       await window.desktopApi.projects.saveStyle({
         projectName: parsed.projectName,
-        globalPrompt: parsed.globalPrompt,
-        imageGlobalPrompt: parsed.imageGlobalPrompt,
-        videoGlobalPrompt: parsed.videoGlobalPrompt,
+        globalPrompt: useIncomingGlobals ? parsed.globalPrompt : existing?.globalPrompt ?? "",
+        imageGlobalPrompt: useIncomingGlobals ? parsed.imageGlobalPrompt : existing?.imageGlobalPrompt ?? "",
+        videoGlobalPrompt: useIncomingGlobals ? parsed.videoGlobalPrompt : existing?.videoGlobalPrompt ?? "",
         migrationPending: false,
-        characterReferencePath: existing?.characterReferencePath ?? null,
+        characterReferencePaths: incomingReferencePaths.length ? incomingReferencePaths : existing?.characterReferencePaths ?? [],
+        characterReferenceNames: incomingReferencePaths.length
+          ? importCharacterReferenceResolution.value?.files.map((file) => file.name) ?? []
+          : existing?.characterReferenceNames ?? [],
         sceneReferencePath: existing?.sceneReferencePath ?? null,
+        sceneReferenceName: existing?.sceneReferenceName ?? null,
         styleReferencePath: existing?.styleReferencePath ?? null,
+        styleReferenceName: existing?.styleReferenceName ?? null,
+        outputDirectory: existing?.outputDirectory ?? importAssets.value.folderPath ?? null,
         lockedModel: existing?.lockedModel ?? null,
         lockedAspectRatio: existing?.lockedAspectRatio ?? null
       });
@@ -548,9 +645,13 @@ function openProjectStyle(projectName: string) {
     imageGlobalPrompt: existing.imageGlobalPrompt,
     videoGlobalPrompt: existing.videoGlobalPrompt,
     migrationPending: existing.migrationPending,
-    characterReferencePath: existing.characterReferencePath,
+    characterReferencePaths: [...existing.characterReferencePaths],
+    characterReferenceNames: [...existing.characterReferenceNames],
     sceneReferencePath: existing.sceneReferencePath,
+    sceneReferenceName: existing.sceneReferenceName,
     styleReferencePath: existing.styleReferencePath,
+    styleReferenceName: existing.styleReferenceName,
+    outputDirectory: existing.outputDirectory,
     lockedModel: existing.lockedModel,
     lockedAspectRatio: existing.lockedAspectRatio
   } : {
@@ -559,9 +660,13 @@ function openProjectStyle(projectName: string) {
     imageGlobalPrompt: "",
     videoGlobalPrompt: "保持首帧造型与画风，动作自然连贯。禁止角色变形、花纹改变、多余肢体、文字和水印。",
     migrationPending: false,
-    characterReferencePath: null,
+    characterReferencePaths: [],
+    characterReferenceNames: [],
     sceneReferencePath: null,
+    sceneReferenceName: null,
     styleReferencePath: null,
+    styleReferenceName: null,
+    outputDirectory: null,
     lockedModel: null,
     lockedAspectRatio: null
   });
@@ -571,16 +676,38 @@ function openProjectStyle(projectName: string) {
 
 async function chooseProjectReference(kind: ProjectReferenceKind) {
   const selected = await window.desktopApi.projects.chooseReference(kind);
-  if (!selected) return;
-  if (kind === "character") styleForm.characterReferencePath = selected;
-  if (kind === "scene") styleForm.sceneReferencePath = selected;
-  if (kind === "style") styleForm.styleReferencePath = selected;
+  if (!selected.length) return;
+  if (kind === "character") {
+    const pairs = new Map(styleForm.characterReferencePaths.map((item, index) => [item, styleForm.characterReferenceNames?.[index] || ""]));
+    selected.forEach((item) => pairs.set(item, fileName(item)));
+    styleForm.characterReferencePaths = [...pairs.keys()];
+    styleForm.characterReferenceNames = [...pairs.values()];
+  }
+  if (kind === "scene") {
+    styleForm.sceneReferencePath = selected[0] ?? null;
+    styleForm.sceneReferenceName = selected[0] ? fileName(selected[0]) : null;
+  }
+  if (kind === "style") {
+    styleForm.styleReferencePath = selected[0] ?? null;
+    styleForm.styleReferenceName = selected[0] ? fileName(selected[0]) : null;
+  }
 }
 
-function clearProjectReference(kind: ProjectReferenceKind) {
-  if (kind === "character") styleForm.characterReferencePath = null;
-  if (kind === "scene") styleForm.sceneReferencePath = null;
-  if (kind === "style") styleForm.styleReferencePath = null;
+function clearProjectReference(kind: ProjectReferenceKind, pathToRemove?: string) {
+  if (kind === "character") {
+    const kept = styleForm.characterReferencePaths
+      .map((item, index) => ({ path: item, name: styleForm.characterReferenceNames?.[index] || "" }))
+      .filter((item) => !pathToRemove || item.path !== pathToRemove);
+    styleForm.characterReferencePaths = pathToRemove ? kept.map((item) => item.path) : [];
+    styleForm.characterReferenceNames = pathToRemove ? kept.map((item) => item.name) : [];
+  }
+  if (kind === "scene") { styleForm.sceneReferencePath = null; styleForm.sceneReferenceName = null; }
+  if (kind === "style") { styleForm.styleReferencePath = null; styleForm.styleReferenceName = null; }
+}
+
+async function chooseProjectOutputDirectory() {
+  const selected = await window.desktopApi.projects.chooseOutputDirectory();
+  if (selected) styleForm.outputDirectory = selected;
 }
 
 async function saveProjectStyle() {
@@ -632,7 +759,10 @@ async function updateTask(task: TaskRecord, status: TaskStatus) {
 
 async function saveSettings() {
   await act(async () => {
-    settings.value = await window.desktopApi.settings.update({ maxActiveWorkers: settings.value.maxActiveWorkers });
+    settings.value = await window.desktopApi.settings.update({
+      maxActiveWorkers: settings.value.maxActiveWorkers,
+      autoClickGenerate: settings.value.autoClickGenerate
+    });
     flash("设置已保存");
   });
 }
@@ -690,6 +820,7 @@ function statusLabel(status: string) {
     queued: "待提交",
     submitted: "已提交",
     running: "执行中",
+    review: "待视频审核",
     succeeded: "已完成",
     failed: "失败",
     cancelled: "已取消"
@@ -716,9 +847,78 @@ function fileName(value: string | null) {
   return value ? value.split(/[\\/]/).at(-1) || value : "";
 }
 
+function localFileUrl(value: string | null) {
+  return value ? encodeURI(`file:///${value.replace(/\\/g, "/")}`) : "";
+}
+
+function characterReferenceName(index: number) {
+  return styleForm.characterReferenceNames?.[index] || "旧版参考图（请重新选择以恢复原文件名）";
+}
+
 function projectHasReferences(projectName: string) {
   const profile = projectStyleByName.value.get(projectName);
-  return Boolean(profile?.characterReferencePath || profile?.sceneReferencePath || profile?.styleReferencePath);
+  return Boolean(profile?.characterReferencePaths.length || profile?.sceneReferencePath || profile?.styleReferencePath);
+}
+
+function videoStageLocked(task: TaskRecord) {
+  return task.firstFrameSource !== "none" && task.imageStatus !== "approved";
+}
+
+function importReferenceFile(name: string) {
+  return importCharacterReferenceResolution.value?.files.find((file) => file.name.toLowerCase() === fileName(name).toLowerCase()) ?? null;
+}
+
+function taskFinalPrompt(task: TaskRecord, stage: PromptStage) {
+  const shotPrompt = stage === "image" ? task.imagePrompt : task.prompt;
+  return composeDeliveryPrompt(stage, shotPrompt, projectStyleByName.value.get(task.projectName));
+}
+
+function importFinalPrompt(shot: ImportedShot, stage: PromptStage) {
+  return composeDeliveryPrompt(stage, stage === "image" ? shot.imagePrompt : shot.videoPrompt, importPromptProfile.value);
+}
+
+function importReferenceMissing(name: string) {
+  return Boolean(importCharacterReferenceResolution.value?.missing.some((item) => item === name || item.startsWith(`${name}（`)));
+}
+
+function promptLength(value: string) {
+  return Array.from(value).length;
+}
+
+function promptBreakdown(stage: PromptStage, shotPrompt: string, profile?: ProjectStyleProfile | null) {
+  return {
+    global: promptLength(projectStagePrompt(stage, profile)),
+    shot: promptLength(shotPrompt),
+    hasException: /本镜例外\s*[:：]/.test(shotPrompt)
+  };
+}
+
+function taskPromptBreakdown(task: TaskRecord, stage: PromptStage) {
+  return promptBreakdown(stage, stage === "image" ? task.imagePrompt : task.prompt, projectStyleByName.value.get(task.projectName));
+}
+
+function importPromptBreakdown(shot: ImportedShot, stage: PromptStage) {
+  return promptBreakdown(stage, stage === "image" ? shot.imagePrompt : shot.videoPrompt, importPromptProfile.value);
+}
+
+function preparationSteps(task: TaskRecord, stage: "image" | "video") {
+  if (stage === "image") return ["检查前置条件", "打开生图页", "设置图片比例", "填写提示词", "等待你在豆包点击生成", "生图中", "下载分镜图候选"];
+  const steps = ["检查前置条件", "打开视频页", "进入视频生成", "设置模型、比例和时长"];
+  if (task.firstFrameSource !== "none") steps.push("上传首帧", "等待首帧缩略图");
+  return [...steps, "填写提示词", "回读并核对模型、比例和时长", "等待你在豆包点击生成", "视频生成中", "下载原视频"];
+}
+
+function preparationStepClass(task: TaskRecord, stage: "image" | "video", step: string) {
+  const state = stage === "image" ? task.imagePrepareState : task.videoPrepareState;
+  const current = stage === "image" ? task.imagePrepareStep : task.videoPrepareStep;
+  const steps = preparationSteps(task, stage);
+  const currentIndex = steps.indexOf(current);
+  const index = steps.indexOf(step);
+  return {
+    current: step === current && state === "running",
+    failed: step === current && state === "failed",
+    done: state === "ready" || (currentIndex >= 0 && index < currentIndex)
+  };
 }
 
 function taskGroupSummary(groupTasks: TaskRecord[]) {
@@ -857,10 +1057,13 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
               <section v-for="group in taskGroups" :key="group.name" class="task-group">
                 <div class="task-group-head">
                   <div><strong>{{ group.name }}</strong><span>{{ taskGroupSummary(group.tasks) }}</span></div>
-                  <button v-if="group.projectName" class="style-lock-button" :class="{ active: hasProjectStyle(projectStyleByName.get(group.projectName)) }" @click="openProjectStyle(group.projectName)">
-                    {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已设全局约束' : '设置全局约束' }}
-                  </button>
-                  <button v-else class="style-lock-button" disabled>命名后可锁定风格</button>
+                  <div class="project-actions">
+                    <span v-if="projectHasReferences(group.projectName)" class="reference-project-warning">参考图需手动上传到豆包</span>
+                    <button v-if="group.projectName" class="style-lock-button" :class="{ active: hasProjectStyle(projectStyleByName.get(group.projectName)) }" @click="openProjectStyle(group.projectName)">
+                      {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已设全局约束' : '设置全局约束' }}
+                    </button>
+                    <button v-else class="style-lock-button" disabled>命名后可锁定风格</button>
+                  </div>
                 </div>
                 <div class="task-items">
                   <article v-for="task in group.tasks" :key="task.id" class="task-item">
@@ -876,37 +1079,82 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                         <strong>分镜视频</strong><small>{{ accountName(task.accountId) }}</small>
                       </div>
                     </div>
-                    <details v-if="task.imagePrompt" class="prompt-detail"><summary>分镜图提示词</summary><p>{{ task.imagePrompt }}</p></details>
-                    <details class="prompt-detail"><summary>分镜视频提示词</summary><p>{{ task.prompt }}</p></details>
+                    <details v-if="task.imagePrompt" class="prompt-detail final-prompt-detail">
+                      <summary>查看最终分镜图提示词 · {{ promptLength(taskFinalPrompt(task, 'image')) }} 字</summary>
+                      <div class="prompt-breakdown"><span>全局 {{ taskPromptBreakdown(task, 'image').global }} 字</span><span>本镜 {{ taskPromptBreakdown(task, 'image').shot }} 字</span><b v-if="taskPromptBreakdown(task, 'image').hasException">本镜例外</b></div>
+                      <pre>{{ taskFinalPrompt(task, 'image') }}</pre>
+                    </details>
+                    <details class="prompt-detail final-prompt-detail">
+                      <summary>查看最终视频提示词 · {{ promptLength(taskFinalPrompt(task, 'video')) }} 字</summary>
+                      <div class="prompt-breakdown"><span>全局 {{ taskPromptBreakdown(task, 'video').global }} 字</span><span>本镜 {{ taskPromptBreakdown(task, 'video').shot }} 字</span><b v-if="taskPromptBreakdown(task, 'video').hasException">本镜例外</b></div>
+                      <pre>{{ taskFinalPrompt(task, 'video') }}</pre>
+                    </details>
                     <details v-if="task.narration" class="prompt-detail narration-detail"><summary>口播 / 旁白（不参与提示词）</summary><p>{{ task.narration }}</p></details>
                     <details v-if="task.notes" class="prompt-detail"><summary>备注（不参与提示词）</summary><p>{{ task.notes }}</p></details>
                     <div class="parameter-sources">
                       <span>模型：{{ task.model }}（{{ parameterSourceLabel(task.modelSource) }}）</span>
                       <span>时长：{{ durationLabel(task.duration) }}（{{ parameterSourceLabel(task.durationSource) }}）</span>
                       <span>画幅：{{ aspectRatioLabel(task.aspectRatio) }}（{{ parameterSourceLabel(task.aspectRatioSource) }}）</span>
+                      <span>生成次数：{{ task.generationCount }}</span>
                     </div>
                     <p v-if="task.imagePath" class="image-path" :title="task.imagePath">已关联：{{ task.firstFrameFileName || fileName(task.imagePath) }}</p>
-                    <div v-if="task.errorMessage" class="task-error-card" role="alert">
+                    <section v-if="task.imageCandidates.length" class="candidate-section">
+                      <strong>分镜图候选</strong>
+                      <div class="candidate-grid">
+                        <article v-for="candidate in task.imageCandidates" :key="candidate.id" :class="candidate.reviewStatus">
+                          <img :src="candidate.previewUrl" :alt="`候选图 ${candidate.candidateIndex}`" />
+                          <small>第 {{ candidate.generationIndex }} 次 · 候选 {{ candidate.candidateIndex }}</small>
+                          <button v-if="candidate.reviewStatus === 'pending'" class="primary small" @click="approveImageCandidate(candidate.id)">审核通过并锁定</button>
+                          <span v-else>{{ candidate.reviewStatus === 'approved' ? '已锁定' : '未采用' }}</span>
+                        </article>
+                      </div>
+                    </section>
+                    <section v-if="task.videoCandidates.length" class="candidate-section video-candidates">
+                      <strong>视频候选</strong>
+                      <div class="candidate-grid">
+                        <article v-for="candidate in task.videoCandidates" :key="candidate.id" :class="candidate.reviewStatus">
+                          <video :src="candidate.previewUrl" controls preload="metadata"></video>
+                          <small :title="candidate.filePath">{{ fileName(candidate.filePath) }}</small>
+                          <small>第 {{ candidate.generationIndex }} 次<span v-if="candidate.hasWatermark"> · 下载地址标记有平台水印</span></small>
+                          <div v-if="candidate.reviewStatus === 'pending'"><button class="primary small" @click="reviewVideoCandidate(candidate.id, true)">通过</button><button @click="reviewVideoCandidate(candidate.id, false)">不通过</button></div>
+                          <span v-else>{{ candidate.reviewStatus === 'approved' ? '已通过' : '已移入作废' }}</span>
+                          <button type="button" @click="openCandidateFolder(candidate.id)">打开文件夹</button>
+                        </article>
+                      </div>
+                    </section>
+                    <div v-if="task.imagePrepareState !== 'idle'" class="prepare-progress" :class="task.imagePrepareState">
+                      <strong>生图准备 · {{ task.imagePrepareStep }}</strong>
+                      <div><span v-for="step in preparationSteps(task, 'image')" :key="step" :class="preparationStepClass(task, 'image', step)">{{ step }}</span></div>
+                      <p v-if="task.imagePrepareMessage">{{ task.imagePrepareMessage }}</p>
+                    </div>
+                    <div v-if="task.videoPrepareState !== 'idle'" class="prepare-progress" :class="task.videoPrepareState">
+                      <strong>视频准备 · {{ task.videoPrepareStep }}</strong>
+                      <div><span v-for="step in preparationSteps(task, 'video')" :key="step" :class="preparationStepClass(task, 'video', step)">{{ step }}</span></div>
+                      <p v-if="task.videoPrepareMessage">{{ task.videoPrepareMessage }}</p>
+                    </div>
+                    <div v-if="task.errorMessage && task.videoPrepareState === 'idle'" class="task-error-card" role="alert">
                       <strong>视频准备失败</strong>
                       <span>{{ task.errorMessage }}</span>
                     </div>
                     <div class="task-meta"><span><template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))">全局提示词已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
                     <div v-if="task.firstFrameSource !== 'none'" class="card-actions stage-actions">
                       <button v-if="task.firstFrameSource === 'generated'" class="primary small" @click="openImageTask(task)">打开生图页</button>
-                      <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记已提交</button>
+                      <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记生图已提交</button>
                       <button v-if="task.firstFrameSource === 'generated' && task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
                       <button @click="chooseTaskImage(task)">{{ task.firstFrameSource === 'local' ? '选择本地首帧' : '选择生成结果' }}</button>
                       <button v-if="task.firstFrameSource === 'generated' && task.imageStatus !== 'failed'" @click="updateImageTask(task, 'failed')">生图失败</button>
                     </div>
                     <div class="card-actions stage-actions">
-                      <button class="primary small" :disabled="task.firstFrameSource !== 'none' && task.imageStatus !== 'approved'" @click="openTask(task)">打开视频页</button>
-                      <button @click="copyTaskPrompt(task)">复制视频提示词</button>
+                      <button class="primary small" :disabled="videoStageLocked(task)" @click="openTask(task)">打开视频页</button>
+                      <button :disabled="videoStageLocked(task)" @click="copyTaskPrompt(task)">复制视频提示词</button>
+                      <button v-if="task.status === 'failed' || task.status === 'running'" :disabled="videoStageLocked(task)" @click="recheckVideoDownload(task)">重新检查并下载</button>
+                      <button :disabled="videoStageLocked(task)" @click="importVideoCandidate(task)">导入视频候选</button>
                       <button @click="editTask(task)">编辑</button>
-                      <button @click="duplicateTask(task)">复制为下一镜</button>
-                      <button v-if="task.status === 'queued' || task.status === 'failed' || task.status === 'cancelled'" @click="updateTask(task, 'submitted')">标记已提交</button>
-                      <button v-if="task.status === 'submitted'" @click="updateTask(task, 'running')">标记生成中</button>
-                      <button v-if="task.status === 'submitted' || task.status === 'running'" @click="updateTask(task, 'succeeded')">标记完成</button>
-                      <button v-if="task.status === 'submitted' || task.status === 'running'" @click="updateTask(task, 'failed')">标记失败</button>
+                      <button :disabled="videoStageLocked(task)" @click="duplicateTask(task)">复制为下一镜</button>
+                      <button v-if="task.status === 'queued' || task.status === 'failed' || task.status === 'cancelled'" :disabled="videoStageLocked(task)" @click="updateTask(task, 'submitted')">标记视频已提交</button>
+                      <button v-if="task.status === 'submitted'" :disabled="videoStageLocked(task)" @click="updateTask(task, 'running')">标记生成中</button>
+                      <button v-if="task.status === 'submitted' || task.status === 'running'" :disabled="videoStageLocked(task)" @click="updateTask(task, 'succeeded')">标记完成</button>
+                      <button v-if="task.status === 'submitted' || task.status === 'running'" :disabled="videoStageLocked(task)" @click="updateTask(task, 'failed')">标记失败</button>
                       <button class="danger" @click="removeTask(task)">删除</button>
                     </div>
                   </article>
@@ -921,7 +1169,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
         <section class="settings-grid">
           <article class="panel setting-card"><p class="eyebrow">CONCURRENCY</p><h2>活动 Worker 上限</h2><p class="muted">账号可以有 20 个，但豆包窗口默认最多同时保留 2 个。</p><div class="stepper"><button @click="settings.maxActiveWorkers = Math.max(1, settings.maxActiveWorkers - 1)">−</button><strong>{{ settings.maxActiveWorkers }}</strong><button @click="settings.maxActiveWorkers = Math.min(3, settings.maxActiveWorkers + 1)">＋</button></div><button class="primary" @click="saveSettings">保存设置</button></article>
           <article class="panel setting-card"><p class="eyebrow">LOCAL DATA</p><h2>数据目录</h2><p class="muted">账号会话、SQLite 数据库和缓存仅保存在本机。</p><code class="path">{{ runtime.dataPath }}</code><p v-if="runtime.dataPathNotice" class="migration-warning">{{ runtime.dataPathNotice }}</p><button @click="chooseDataDirectory">更改目录</button><p class="security-note">迁移时保留原目录作为备份；不保存密码、短信验证码或 2FA 密钥。</p></article>
-          <article class="panel setting-card"><p class="eyebrow">AUTOMATION</p><h2>自动执行适配器</h2><p class="muted">核心接口已经隔离，当前默认保持关闭。下一阶段接入豆包页面适配器后再开放。</p><span class="coming">准备中</span></article>
+          <article class="panel setting-card"><p class="eyebrow">AUTOMATION</p><h2>自动点击生成</h2><p class="muted">默认关闭。开启后仅在提示词、模型、比例、时长及首帧缩略图全部回读一致时点击；不一致会停止并常驻报错。</p><label class="checkbox-row"><input v-model="settings.autoClickGenerate" type="checkbox" />准备完成后自动点击生成</label><button class="primary" @click="saveSettings">保存设置</button></article>
           <article class="panel setting-card"><p class="eyebrow">DIAGNOSTICS</p><h2>诊断信息</h2><p class="muted">版本 v{{ runtime.version }}。日志只记录程序事件和错误，不记录 Cookie、密码或验证码。</p><code class="path">{{ runtime.logPath }}</code><button @click="exportDiagnostics">导出诊断信息</button><p class="security-note">发送诊断文件前仍建议自行检查内容。</p></article>
         </section>
       </template>
@@ -967,6 +1215,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
           <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
           <label>口播 / 旁白（选填，不参与提示词）<textarea v-model="taskForm.narration" rows="2" placeholder="后续可用于字幕或配音稿"></textarea></label>
           <label>备注（选填，不参与提示词）<textarea v-model="taskForm.notes" rows="2"></textarea></label>
+          <label>生成次数（候选数量）<input v-model.number="taskForm.generationCount" type="number" min="1" max="20" step="1" /></label>
         </div>
 
         <div class="form-row">
@@ -981,30 +1230,54 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
     <div v-if="showImportDialog" class="modal-backdrop" @click.self="showImportDialog = false">
       <form class="modal import-modal" @submit.prevent="importStoryboardTasks">
         <p class="eyebrow">BATCH STORYBOARD</p><h2>批量导入整套分镜</h2>
-        <p class="muted">支持 JSON 或 Markdown。每个分镜可指定首帧来源；本地图片可写文件名，也可留空后按分镜编号自动匹配。</p>
+        <p class="muted">支持协议 v1 的 JSON 或 Markdown。每个分镜可指定首帧来源；角色参考图和本地首帧均可写素材文件夹内的文件名。</p>
         <label>项目名称（原文中有项目名称时可留空）<input v-model="importProjectName" placeholder="例如：柯基水草球短片" /></label>
         <label>分镜内容<textarea v-model="importText" rows="12" placeholder="项目名称：柯基短片&#10;全局提示词：吉卜力风格…&#10;### 分镜 1&#10;首帧来源：本地图片&#10;首帧图：01.png&#10;视频提示词：……&#10;时长：10秒&#10;画幅：9:16"></textarea></label>
-        <div v-if="importPreview.storyboard" class="import-result success">识别到 {{ importPreview.storyboard.shots.length }} 个分镜 · 项目：{{ importPreview.storyboard.projectName }}</div>
+        <div v-if="importPreview.storyboard" class="import-result success">格式 v{{ importPreview.storyboard.formatVersion }} · 识别到 {{ importPreview.storyboard.shots.length }} 个分镜 · 项目：{{ importPreview.storyboard.projectName }}</div>
+        <div v-if="importPreview.storyboard" class="parameter-sources import-defaults"><span>默认模型：{{ importPreview.storyboard.defaultModel }}</span><span>默认时长：{{ durationLabel(importPreview.storyboard.defaultDuration) }}</span><span>默认画幅：{{ aspectRatioLabel(importPreview.storyboard.defaultAspectRatio) }}</span></div>
         <div v-else-if="importPreview.error" class="import-result error">{{ importPreview.error }}</div>
         <div v-if="importPreview.storyboard?.warnings.length" class="import-warning-list">
           <strong>发现 {{ importPreview.storyboard.warnings.length }} 个疑似字段（原文已保留）</strong>
           <span v-for="warning in importPreview.storyboard.warnings" :key="`${warning.lineNumber}-${warning.label}`">{{ warning.message }}</span>
         </div>
-        <template v-if="importPreview.storyboard?.shots.some(shot => shot.firstFrameSource === 'local')">
-          <div class="asset-folder-row"><div><strong>本地首帧素材</strong><span>{{ importAssets.folderPath || '尚未选择文件夹；绝对路径可直接识别' }}</span></div><button type="button" @click="chooseImportAssetFolder">选择素材文件夹</button></div>
+        <template v-if="importPreview.storyboard && (importPreview.storyboard.shots.some(shot => shot.firstFrameSource === 'local') || importPreview.storyboard.characterReferenceImages.length)">
+          <div class="asset-folder-row"><div><strong>项目图片素材</strong><span>{{ importAssets.folderPath || '尚未选择文件夹；绝对路径可直接识别' }}</span></div><button type="button" @click="chooseImportAssetFolder">选择素材文件夹</button></div>
+          <div v-if="importPreview.storyboard.characterReferenceImages.length" class="asset-preview-list reference-assets">
+            <article v-for="name in importPreview.storyboard.characterReferenceImages" :key="name" :class="{ invalid: importReferenceMissing(name) }">
+              <img v-if="importReferenceFile(name)?.thumbnailUrl" :src="importReferenceFile(name)?.thumbnailUrl" alt="" />
+              <div><strong>角色参考图</strong><span>{{ name }}</span><small v-if="importReferenceMissing(name)">未找到：{{ name }}（不阻止导入）</small><small v-else>已找到并将写入项目全局约束</small></div>
+            </article>
+          </div>
           <div v-if="importAssetResolution" class="asset-preview-list">
             <article v-for="item in importAssetResolution.shots.filter(item => importPreview.storyboard?.shots.find(shot => shot.shotNumber === item.shotNumber)?.firstFrameSource === 'local')" :key="item.shotNumber" :class="{ invalid: item.error }">
               <img v-if="item.file?.thumbnailUrl" :src="item.file.thumbnailUrl" alt="" />
               <div><strong>分镜 {{ item.shotNumber }}</strong><span>{{ item.file?.name || item.error }}</span><small v-if="item.warning">{{ item.warning }}</small></div>
             </article>
           </div>
-          <p v-if="importAssetResolution?.unusedFiles.length" class="import-warning">文件夹中还有 {{ importAssetResolution.unusedFiles.length }} 张未匹配图片，不会导入。</p>
+          <p v-if="importUnusedFiles.length" class="import-warning">文件夹中还有 {{ importUnusedFiles.length }} 张未匹配图片，不会导入。</p>
         </template>
         <div v-if="importGlobalConflict" class="global-conflict">
           <strong>导入稿的全局提示词与项目现有设置不同</strong>
           <label><input v-model="importGlobalChoice" type="radio" value="incoming" />使用导入稿</label>
           <label><input v-model="importGlobalChoice" type="radio" value="existing" />保留现有设置</label>
         </div>
+        <section v-if="importPreview.storyboard" class="import-prompt-preview-list">
+          <strong>导入前确认最终提示词</strong>
+          <article v-for="shot in importPreview.storyboard.shots" :key="shot.shotNumber">
+            <h4>分镜 {{ shot.shotNumber }}{{ shot.shotName ? ` · ${shot.shotName}` : '' }}</h4>
+            <p v-for="warning in importPreview.storyboard.warnings.filter(item => item.shotNumber === shot.shotNumber)" :key="warning.lineNumber" class="import-warning">{{ warning.message }}</p>
+            <details v-if="shot.imagePrompt" class="prompt-preview">
+              <summary>最终分镜图提示词 · {{ promptLength(importFinalPrompt(shot, 'image')) }} 字</summary>
+              <div class="prompt-breakdown"><span>全局 {{ importPromptBreakdown(shot, 'image').global }} 字</span><span>本镜 {{ importPromptBreakdown(shot, 'image').shot }} 字</span><b v-if="importPromptBreakdown(shot, 'image').hasException">本镜例外</b></div>
+              <pre>{{ importFinalPrompt(shot, 'image') }}</pre>
+            </details>
+            <details class="prompt-preview">
+              <summary>最终视频提示词 · {{ promptLength(importFinalPrompt(shot, 'video')) }} 字</summary>
+              <div class="prompt-breakdown"><span>全局 {{ importPromptBreakdown(shot, 'video').global }} 字</span><span>本镜 {{ importPromptBreakdown(shot, 'video').shot }} 字</span><b v-if="importPromptBreakdown(shot, 'video').hasException">本镜例外</b></div>
+              <pre>{{ importFinalPrompt(shot, 'video') }}</pre>
+            </details>
+          </article>
+        </section>
         <div class="modal-actions"><button type="button" @click="showImportDialog = false">取消</button><button class="primary" type="submit" :disabled="!canImportStoryboard">导入并自动分配</button></div>
       </form>
     </div>
@@ -1016,18 +1289,26 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
 
         <div class="reference-grid">
           <article>
-            <strong>角色 / 宠物定妆图</strong><span>{{ fileName(styleForm.characterReferencePath) || '未选择' }}</span>
-            <div><button type="button" @click="chooseProjectReference('character')">选择</button><button v-if="styleForm.characterReferencePath" type="button" @click="clearProjectReference('character')">清除</button></div>
+            <strong>角色 / 宠物定妆图（可多选）</strong><span>{{ styleForm.characterReferencePaths.length ? `${styleForm.characterReferencePaths.length} 张` : '未选择' }}</span>
+            <ul v-if="styleForm.characterReferencePaths.length" class="reference-file-list"><li v-for="(referencePath, index) in styleForm.characterReferencePaths" :key="referencePath"><img class="reference-thumb" :src="localFileUrl(referencePath)" alt="" /><span :title="referencePath">{{ characterReferenceName(index) }}</span><button type="button" @click="clearProjectReference('character', referencePath)">×</button></li></ul>
+            <div><button type="button" @click="chooseProjectReference('character')">添加图片</button><button v-if="styleForm.characterReferencePaths.length" type="button" @click="clearProjectReference('character')">全部清除</button></div>
           </article>
           <article>
-            <strong>场景参考图</strong><span>{{ fileName(styleForm.sceneReferencePath) || '未选择' }}</span>
+            <strong>场景参考图</strong><img v-if="styleForm.sceneReferencePath" class="reference-thumb large" :src="localFileUrl(styleForm.sceneReferencePath)" alt="" /><span>{{ styleForm.sceneReferenceName || (styleForm.sceneReferencePath ? '旧版参考图（请重新选择以恢复原文件名）' : '未选择') }}</span>
             <div><button type="button" @click="chooseProjectReference('scene')">选择</button><button v-if="styleForm.sceneReferencePath" type="button" @click="clearProjectReference('scene')">清除</button></div>
           </article>
           <article>
-            <strong>风格参考图</strong><span>{{ fileName(styleForm.styleReferencePath) || '未选择' }}</span>
+            <strong>风格参考图</strong><img v-if="styleForm.styleReferencePath" class="reference-thumb large" :src="localFileUrl(styleForm.styleReferencePath)" alt="" /><span>{{ styleForm.styleReferenceName || (styleForm.styleReferencePath ? '旧版参考图（请重新选择以恢复原文件名）' : '未选择') }}</span>
             <div><button type="button" @click="chooseProjectReference('style')">选择</button><button v-if="styleForm.styleReferencePath" type="button" @click="clearProjectReference('style')">清除</button></div>
           </article>
         </div>
+        <p v-if="styleForm.characterReferencePaths.length || styleForm.sceneReferencePath || styleForm.styleReferencePath" class="reference-upload-warning">参考图需手动上传到豆包；工作台会保留缩略图和原文件名用于核对，但不会把这些图片自动加入豆包输入框。</p>
+
+        <article class="project-output-card">
+          <strong>项目输出目录</strong>
+          <code class="path">{{ styleForm.outputDirectory || '使用应用数据目录（旧项目保持原位置）' }}</code>
+          <button type="button" @click="chooseProjectOutputDirectory">更改输出目录</button>
+        </article>
 
         <div class="style-fields">
           <label>共用全局提示词<textarea v-model="styleForm.globalPrompt" rows="4" placeholder="例如：吉卜力风格宠物动画；统一角色造型、花纹、场景、光线和色彩…"></textarea></label>

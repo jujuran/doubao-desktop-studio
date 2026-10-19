@@ -1,4 +1,7 @@
 import { BrowserWindow, clipboard, session } from "electron";
+import type { DownloadItem, Event } from "electron";
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { Account } from "./contracts.js";
 import { extractDoubaoIdentity, type DoubaoIdentity } from "./identity.js";
 import {
@@ -11,6 +14,7 @@ import {
   normalizedModelName,
   parseDoubaoImageAspectText,
   parseDoubaoVideoParameterText,
+  videoSourceHasWatermark,
   type DoubaoVideoModeSnapshot,
   type DoubaoVideoSettings
 } from "../src/doubao-video.js";
@@ -34,6 +38,31 @@ interface MonitorState {
   hasIdentity: boolean;
   loginRequiredReported: boolean;
   consecutiveMissing: number;
+}
+
+export interface PreparationProgress {
+  stage: "image" | "video";
+  state: "running";
+  step: string;
+}
+
+export interface GenerationMonitorOptions {
+  route: "image" | "video";
+  prompt: string;
+  outputFolder: string;
+  baseName: string;
+  generationIndex: number;
+  autoClick: boolean;
+  imageAspectRatio?: string;
+  videoSettings?: DoubaoVideoSettings;
+  expectsFirstFrame?: boolean;
+  onProgress?: (state: "waiting" | "started" | "completed", step: string) => void;
+}
+
+export interface DownloadedGenerationCandidate {
+  sourceUrl: string;
+  filePath: string;
+  hasWatermark: boolean;
 }
 
 export class AccountSessionManager {
@@ -119,36 +148,37 @@ export class AccountSessionManager {
     prompt: string,
     attachmentPath: string | null = null,
     videoSettings?: DoubaoVideoSettings,
-    imageAspectRatio?: string
+    imageAspectRatio?: string,
+    onProgress?: (progress: PreparationProgress) => void
   ) {
+    onProgress?.({ stage: route, state: "running", step: route === "video" ? "打开视频页" : "打开生图页" });
     const win = this.open(account, route, true);
     await waitForLoad(win);
     if (route === "video") {
       if (!videoSettings) throw new Error("缺少视频模型、比例和时长设置");
       const run = <T>(step: string, operation: () => Promise<T>) => runVideoStep(
-        step,
-        prompt,
-        operation,
-        (level, event, details) => this.events.onDiagnostic(level, event, {
-          accountId: shortAccountId(account.id),
-          step,
-          ...details
+        step, prompt, operation, (level, event, details) => this.events.onDiagnostic(level, event, {
+          accountId: shortAccountId(account.id), step, ...details
         })
       );
-      await run("进入视频生成", () => enterVideoGeneration(win));
-      await run("设置模型、比例和时长", () => applyVideoSettings(win, videoSettings));
+      const runWithProgress = <T>(step: string, operation: () => Promise<T>) => {
+        onProgress?.({ stage: "video", state: "running", step });
+        return run(step, operation);
+      };
+      await runWithProgress("进入视频生成", () => enterVideoGeneration(win));
+      await runWithProgress("设置模型、比例和时长", () => applyVideoSettings(win, videoSettings));
       if (attachmentPath) {
-        const previousThumbnailCount = await run("上传首帧", () => attachFirstFrame(win, attachmentPath));
-        await run("等待首帧缩略图", async () => {
+        const previousThumbnailCount = await runWithProgress("上传首帧", () => attachFirstFrame(win, attachmentPath));
+        await runWithProgress("等待首帧缩略图", async () => {
           if (!await waitForUploadedThumbnail(win, previousThumbnailCount)) {
             throw new Error("上传后没有检测到首帧缩略图");
           }
         });
       }
-      await run("填写提示词", async () => {
+      await runWithProgress("填写提示词", async () => {
         if (!await fillAndConfirmComposer(win, prompt)) throw new Error("豆包输入框没有保留完整提示词");
       });
-      await run("回读并核对模型、比例和时长", async () => {
+      await runWithProgress("回读并核对模型、比例和时长", async () => {
         const actual = await readVideoSettings(win);
         const mismatches = compareDoubaoVideoSettings(videoSettings, actual);
         if (mismatches.length) {
@@ -157,15 +187,64 @@ export class AccountSessionManager {
       });
     } else {
       if (!imageAspectRatio) throw new Error("缺少生图画幅设置");
+      onProgress?.({ stage: "image", state: "running", step: "进入图像生成" });
+      await runImageStep("进入图像生成", prompt, () => enterImageGeneration(win), (level, event, details) => {
+        this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "进入图像生成", ...details });
+      });
+      onProgress?.({ stage: "image", state: "running", step: "设置图片比例" });
       await runImageStep("设置图片比例", prompt, () => applyImageAspectRatio(win, imageAspectRatio), (level, event, details) => {
         this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "设置图片比例", ...details });
       });
       if (attachmentPath) await attachFirstFrame(win, attachmentPath);
-      if (!await fillAndConfirmComposer(win, prompt)) {
-        throw new Error("豆包输入框未能保留提示词；提示词已复制到剪贴板，请手动粘贴后继续");
-      }
+      onProgress?.({ stage: "image", state: "running", step: "填写提示词" });
+      await runImageStep("填写提示词", prompt, async () => {
+        if (!await fillAndConfirmComposer(win, prompt)) throw new Error("豆包输入框未能保留提示词");
+      }, (level, event, details) => {
+        this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "填写提示词", ...details });
+      });
     }
     return win;
+  }
+
+  async monitorGeneration(account: Account, options: GenerationMonitorOptions): Promise<DownloadedGenerationCandidate[]> {
+    const win = this.windows.get(account.id);
+    if (!win || win.isDestroyed()) throw new Error("豆包窗口已关闭，无法监测生成结果");
+    const baseline = await readGenerationSnapshot(win, options.route);
+    if (options.autoClick) {
+      await verifyBeforeSubmit(win, options);
+      if (!await clickGenerateButton(win)) throw new Error("生成前核对已通过，但没有找到可点击的生成按钮");
+    } else {
+      options.onProgress?.("waiting", "等待你在豆包点击生成");
+    }
+    const started = options.route === "video"
+      ? await waitForVideoGenerationStart(win, baseline, options.autoClick, options.onProgress)
+      : await waitForGenerationStart(win, baseline, options.route, 30 * 60_000);
+    if (!started) throw new Error("等待手动点击生成超时，请重新打开任务");
+    options.onProgress?.("started", options.route === "image" ? "生图中" : "视频生成中");
+    const completed = await waitForGenerationCompletion(win, baseline, options.route, options.onProgress);
+    options.onProgress?.("completed", options.route === "image" ? "下载分镜图候选" : "下载原视频");
+    mkdirSync(options.outputFolder, { recursive: true });
+    if (options.route === "image") {
+      const results: DownloadedGenerationCandidate[] = [];
+      for (let index = 0; index < completed.imageUrls.length; index += 1) {
+        const sourceUrl = completed.imageUrls[index];
+        const response = await win.webContents.session.fetch(sourceUrl);
+        if (!response.ok) throw new Error(`候选图下载失败：HTTP ${response.status}`);
+        const contentType = response.headers.get("content-type") || "";
+        const extension = contentType.includes("png") || /\.png(?:\?|$)/i.test(sourceUrl) ? ".png" : ".jpg";
+        const filePath = uniqueDownloadPath(path.join(options.outputFolder, `${options.baseName}_候选${index + 1}${extension}`));
+        writeFileSync(filePath, Buffer.from(await response.arrayBuffer()));
+        results.push({ sourceUrl, filePath, hasWatermark: false });
+      }
+      return results;
+    }
+    return [await downloadOfficialOriginal(win, options.outputFolder, options.baseName)];
+  }
+
+  async downloadLatestVideo(account: Account, outputFolder: string, baseName: string) {
+    const win = this.windows.get(account.id);
+    if (!win || win.isDestroyed()) throw new Error("请先打开账号对应的豆包对话，再重新检查下载");
+    return downloadOfficialOriginal(win, outputFolder, baseName);
   }
 
   async verify(account: Account) {
@@ -288,6 +367,36 @@ async function runImageStep<T>(
   }
 }
 
+async function enterImageGeneration(win: BrowserWindow) {
+  const active = async () => {
+    const snapshot = await win.webContents.executeJavaScript(`
+      (() => {
+        const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+        const texts = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], [tabindex], [class*="select" i], [class*="trigger" i]')).filter(visible).map(element => (element.textContent || '').replace(/\\s+/g, ' ').trim());
+        const selectedImageTab = Array.from(document.querySelectorAll('[role="tab"][aria-selected="true"], [data-testid="creation-skill-switch-tab-image"][data-state="active"]')).filter(visible).some(element => (element.textContent || '').replace(/\\s+/g, '').trim() === '图像');
+        return { texts, selectedImageTab };
+      })()
+    `, true) as { texts: string[]; selectedImageTab: boolean };
+    const hasMode = snapshot.selectedImageTab || snapshot.texts.some((value) => /^图像生成(?:[×✕✖xX])?$/.test(value.replace(/\s+/g, "")));
+    const hasModel = snapshot.texts.some((value) => /Seedream/i.test(value));
+    const hasAspect = snapshot.texts.some((value) => parseDoubaoImageAspectText(value) !== null);
+    return hasMode && hasModel && hasAspect;
+  };
+  if (await active()) return;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await dismissDesktopDownloadPrompt(win);
+    if (!await clickVisibleText(win, ["图像生成"], true)) {
+      if (await clickVisibleText(win, ["AI 创作"], true)) {
+        await delay(700);
+        await clickVisibleText(win, ["图像"], true);
+      }
+    }
+    if (await waitUntil(active, 5_000, 350)) return;
+    await delay(500);
+  }
+  throw new Error("没有确认豆包已切换到图像生成技能");
+}
+
 async function applyImageAspectRatio(win: BrowserWindow, aspectRatio: string) {
   const expected = doubaoAspectRatio(aspectRatio);
   const controlReady = await waitUntil(async () => Boolean(await findImageAspectControl(win)), 12_000, 350);
@@ -391,6 +500,7 @@ async function enterVideoGeneration(win: BrowserWindow) {
   if (await isVideoGenerationActive(win)) return;
   const ready = await waitUntil(() => isVideoHomeReady(win), 15_000, 400);
   if (!ready) throw new Error("豆包新对话页加载超时，没有出现技能入口或输入框");
+  await dismissDesktopDownloadPrompt(win);
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     if (await isVideoGenerationActive(win)) return;
     let clicked = await clickVisibleText(win, ["视频生成"], true)
@@ -403,10 +513,35 @@ async function enterVideoGeneration(win: BrowserWindow) {
         || await clickVisibleText(win, ["视频生成"], false);
     }
     if (clicked && await waitUntil(() => isVideoGenerationActive(win), 5_000, 350)) return;
+    if (await enterAiCreationVideo(win)) return;
     await delay(700);
   }
   const snapshot = await readVideoGenerationSnapshot(win);
   throw new Error(`已重试 3 次，但没有确认视频生成激活状态（标签：${snapshot.modeLabels.join("/") || "未识别"}；输入提示：${snapshot.composerPlaceholders.join("/") || "未识别"}；控件：${snapshot.controlTexts.filter((value) => /Seedance|自动|\d+:\d+/.test(value)).slice(0, 4).join("/") || "未识别"}）`);
+}
+
+async function dismissDesktopDownloadPrompt(win: BrowserWindow) {
+  if (await clickVisibleText(win, ["下次提醒我"], true)) await delay(300);
+}
+
+async function enterAiCreationVideo(win: BrowserWindow) {
+  await dismissDesktopDownloadPrompt(win);
+  if (!await clickVisibleText(win, ["AI 创作"], true)) return false;
+  await delay(900);
+  if (await isVideoGenerationActive(win)) return true;
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const tabs = Array.from(document.querySelectorAll('[data-testid="creation-skill-switch-tab-video"], [role="tab"]')).filter(visible);
+      const target = tabs.find(element => (element.textContent || '').replace(/\s+/g, '').trim() === '视频');
+      if (!target) return null;
+      const rect = target.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (!point) return false;
+  await clickPoint(win, point.x, point.y);
+  return waitUntil(() => isVideoGenerationActive(win), 5_000, 350);
 }
 
 async function isVideoGenerationActive(win: BrowserWindow) {
@@ -425,7 +560,8 @@ async function readVideoGenerationSnapshot(win: BrowserWindow) {
       const modeLabels = Array.from(document.querySelectorAll('body *')).filter(element => {
         if (!visible(element)) return false;
         const normalized = text(element).replace(/\s+/g, '');
-        if (!/^视频生成(?:[×✕✖xX])?$/.test(normalized)) return false;
+        const selectedVideoTab = normalized === '视频' && element.matches('[role="tab"][aria-selected="true"], [data-testid="creation-skill-switch-tab-video"][data-state="active"]');
+        if (!/^视频生成(?:[×✕✖xX])?$/.test(normalized) && !selectedVideoTab) return false;
         return !Array.from(element.children).some(child => text(child).replace(/\s+/g, '') === normalized);
       }).map(text);
       const composerPlaceholders = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]'))
@@ -682,7 +818,7 @@ async function clickVisibleText(win: BrowserWindow, labels: string[], exact: boo
     (() => {
       const labels = ${JSON.stringify(labels)}.map(value => value.toLowerCase());
       const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
-      const elements = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [role="menuitem"], li, [tabindex]')).filter(visible);
+      const elements = Array.from(document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], li, [tabindex]')).filter(visible);
       const matches = elements.filter(element => {
         const text = (element.textContent || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
         return labels.some(label => ${exact} ? text === label : text.includes(label));
@@ -702,7 +838,7 @@ async function hasVisibleText(win: BrowserWindow, labels: string[], exact: boole
     (() => {
       const labels = ${JSON.stringify(labels)}.map(value => value.toLowerCase());
       const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
-      return Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [role="menuitem"], li, [tabindex]')).filter(visible).some(element => {
+      return Array.from(document.querySelectorAll('button, a, [role="button"], [role="option"], [role="menuitem"], li, [tabindex]')).filter(visible).some(element => {
         const text = (element.textContent || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
         return labels.some(label => ${exact} ? text === label : text.includes(label));
       });
@@ -879,6 +1015,346 @@ async function fillComposer(win: BrowserWindow, prompt: string) {
       return true;
     })()
   `, true) as Promise<boolean>;
+}
+
+interface GenerationSnapshot {
+  url: string;
+  bodyText: string;
+  composerText: string;
+  imageUrls: string[];
+  videoCardCount: number;
+}
+
+async function readGenerationSnapshot(win: BrowserWindow, route: "image" | "video"): Promise<GenerationSnapshot> {
+  return win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const composer = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]')).filter(visible).sort((a, b) => {
+        const ar = a.getBoundingClientRect(); const br = b.getBoundingClientRect();
+        return br.width * br.height - ar.width * ar.height;
+      })[0];
+      const composerText = composer ? (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement ? composer.value : (composer.innerText || composer.textContent || '')) : '';
+      const imageUrls = Array.from(document.images).filter(image => {
+        const src = image.currentSrc || image.src || '';
+        return image.naturalWidth >= 512 && image.naturalHeight >= 512 && /rc_gen_image|cgen_wm0|imagex-sign/i.test(src) && !/avatar|emoji|icon|video_dsz/i.test(src);
+      }).map(image => image.currentSrc || image.src).filter((value, index, values) => value && values.indexOf(value) === index);
+      return {
+        url: location.href,
+        bodyText: document.body.innerText || '',
+        composerText,
+        imageUrls,
+        videoCardCount: document.querySelectorAll('[class*="block-video"]').length
+      };
+    })()
+  `, true) as Promise<GenerationSnapshot>;
+}
+
+async function verifyBeforeSubmit(win: BrowserWindow, options: GenerationMonitorOptions) {
+  if (!await composerContains(win, options.prompt)) throw new Error("自动生成已拦截：提示词回读不一致");
+  if (options.route === "image") {
+    const expected = doubaoAspectRatio(options.imageAspectRatio || "");
+    const actual = doubaoAspectRatio(await readImageAspectRatio(win));
+    if (!expected || actual !== expected) throw new Error(`自动生成已拦截：图片比例为 ${actual || "未识别"}，应为 ${expected || "未设置"}`);
+    return;
+  }
+  if (!options.videoSettings) throw new Error("自动生成已拦截：缺少视频参数");
+  const mismatches = compareDoubaoVideoSettings(options.videoSettings, await readVideoSettings(win));
+  if (mismatches.length) throw new Error(`自动生成已拦截：${mismatches.join("；")}`);
+  if (options.expectsFirstFrame && await countUploadedThumbnails(win) < 1) {
+    throw new Error("自动生成已拦截：没有回读到首帧缩略图");
+  }
+}
+
+async function clickGenerateButton(win: BrowserWindow) {
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const selectors = '.send-btn-wrapper button, button[data-testid*="send" i], button[aria-label*="生成"], button[aria-label*="发送"]';
+      const candidates = Array.from(document.querySelectorAll(selectors)).filter(element => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
+      const element = candidates[candidates.length - 1];
+      if (!element) return null;
+      const r = element.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (!point) return false;
+  await clickPoint(win, point.x, point.y);
+  return true;
+}
+
+async function waitForGenerationStart(
+  win: BrowserWindow,
+  baseline: GenerationSnapshot,
+  route: "image" | "video",
+  timeout: number
+) {
+  return waitUntil(async () => {
+    if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
+    const current = await readGenerationSnapshot(win, route);
+    const failure = generationFailure(current.bodyText);
+    if (failure) throw new Error(failure);
+    const composerCleared = normalizeComposerText(current.composerText) === "" && normalizeComposerText(baseline.composerText) !== "";
+    const progress = route === "image"
+      ? /正在生成图片|图片生成中|已生成图片/.test(current.bodyText)
+      : /大约需要\s*\d+\s*[-–—至]\s*\d+\s*分钟|视频生成好后|视频生成中|你的视频生成好了/.test(current.bodyText);
+    return current.url !== baseline.url || composerCleared || progress;
+  }, timeout, 1_000);
+}
+
+async function waitForVideoGenerationStart(
+  win: BrowserWindow,
+  baseline: GenerationSnapshot,
+  autoClick: boolean,
+  onProgress?: GenerationMonitorOptions["onProgress"]
+) {
+  let confirmationSent = false;
+  let lastNotice = "";
+  const startedAt = Date.now();
+  while (true) {
+    if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
+    const current = await readGenerationSnapshot(win, "video");
+    const recentText = current.bodyText.slice(-6_000);
+    const safetyConfirmation = /安全确认|上传素材.{0,30}(?:已获|获得).{0,12}授权|确认.{0,20}(?:拥有|获得).{0,12}授权/.test(recentText);
+    const confirmationRequested = /确认后我再开始生成视频|确认后(?:再)?开始生成|请确认(?:后)?(?:我再)?开始生成/.test(recentText);
+    const generationStarted = /视频生成好后|视频生成中|预计等待\s*\d+\s*分钟|大约需要\s*\d+\s*[-–—至]\s*\d+\s*分钟|你的视频生成好了/.test(recentText);
+    if (generationStarted || current.videoCardCount > baseline.videoCardCount) return true;
+
+    if (safetyConfirmation) {
+      if (lastNotice !== "请在豆包完成安全确认") {
+        onProgress?.("waiting", "请在豆包完成安全确认");
+        lastNotice = "请在豆包完成安全确认";
+      }
+      await delay(1_000);
+      continue;
+    }
+
+    if (confirmationRequested) {
+      if (lastNotice !== "等待在豆包确认") {
+        onProgress?.("waiting", "等待在豆包确认");
+        lastNotice = "等待在豆包确认";
+      }
+      if (autoClick && !confirmationSent) {
+        await clearComposerAttachments(win);
+        if (!await fillAndConfirmComposer(win, "确认")) throw new Error("豆包要求二次确认，但工作台未能填入纯文字“确认”");
+        if (!await clickGenerateButton(win)) throw new Error("豆包要求二次确认，但工作台没有找到确认消息发送按钮");
+        confirmationSent = true;
+        await delay(600);
+        await clearComposerAttachments(win);
+      }
+      await delay(800);
+      continue;
+    }
+
+    const elapsedMinutes = Math.floor((Date.now() - startedAt) / 60_000);
+    if (elapsedMinutes >= 30 && lastNotice !== "尚未确认开始，继续监听") {
+      onProgress?.("waiting", "尚未确认开始，继续监听");
+      lastNotice = "尚未确认开始，继续监听";
+    }
+    await delay(1_000);
+  }
+}
+
+async function clearComposerAttachments(win: BrowserWindow) {
+  await win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const composer = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]')).filter(visible).sort((a, b) => {
+        const ar = a.getBoundingClientRect(); const br = b.getBoundingClientRect(); return br.width * br.height - ar.width * ar.height;
+      })[0];
+      if (!composer) return 0;
+      const composerRect = composer.getBoundingClientRect();
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(button => {
+        if (!visible(button)) return false;
+        const rect = button.getBoundingClientRect();
+        const label = (button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '').replace(/\\s+/g, '').trim();
+        return rect.bottom >= composerRect.top - 240 && rect.top <= composerRect.bottom && /^(删除|移除|清除|关闭)(附件|图片)?$/.test(label);
+      });
+      buttons.forEach(button => button.click());
+      Array.from(document.querySelectorAll('input[type="file"]')).forEach(input => { try { input.value = ''; } catch {} });
+      return buttons.length;
+    })()
+  `, true);
+  await delay(250);
+}
+
+async function waitForGenerationCompletion(
+  win: BrowserWindow,
+  baseline: GenerationSnapshot,
+  route: "image" | "video",
+  onProgress?: GenerationMonitorOptions["onProgress"]
+) {
+  const deadline = Date.now() + 8 * 60_000;
+  const startedAt = Date.now();
+  let expectedMinutes = 0;
+  let lastProgressMinute = -1;
+  let overdueReported = false;
+  const beforeImages = new Set(baseline.imageUrls);
+  while (route === "video" || Date.now() < deadline) {
+    if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
+    const current = await readGenerationSnapshot(win, route);
+    const failure = generationFailure(current.bodyText);
+    if (failure && route === "image") throw new Error(failure);
+    const imageUrls = current.imageUrls.filter((url) => !beforeImages.has(url));
+    if (route === "image" && imageUrls.length && /已生成图片|生成的图片|图片已生成/.test(current.bodyText)) {
+      await delay(2_000);
+      const stable = await readGenerationSnapshot(win, route);
+      const stableUrls = stable.imageUrls.filter((url) => !beforeImages.has(url));
+      if (stableUrls.length) return { ...stable, imageUrls: stableUrls };
+    }
+    if (route === "video" && current.videoCardCount > baseline.videoCardCount && /视频生成好了|视频已生成/.test(current.bodyText)) {
+      return current;
+    }
+    if (route === "video") {
+      expectedMinutes = parseExpectedWaitMinutes(current.bodyText) || expectedMinutes;
+      const elapsedMinutes = Math.floor((Date.now() - startedAt) / 60_000);
+      if (failure) onProgress?.("waiting", `${failure.replace("豆包报告生成失败：", "豆包提示：")} · 仍在继续监听`);
+      else if (elapsedMinutes !== lastProgressMinute) {
+        const estimate = expectedMinutes ? `预计 ${expectedMinutes} 分钟 · ` : "";
+        onProgress?.("started", `${estimate}已等 ${elapsedMinutes} 分钟`);
+        lastProgressMinute = elapsedMinutes;
+      }
+      const overdueMinutes = Math.max(30, expectedMinutes * 2);
+      if (elapsedMinutes >= overdueMinutes && !overdueReported) {
+        onProgress?.("waiting", "可能仍在生成，请去豆包查看 · 工作台继续监听");
+        overdueReported = true;
+      }
+    }
+    await delay(route === "image" ? 1_500 : 3_000);
+  }
+  throw new Error("等待分镜图生成完成超时");
+}
+
+function parseExpectedWaitMinutes(bodyText: string) {
+  const recent = bodyText.slice(-6_000);
+  const exact = /预计等待\s*(\d+)\s*分钟/.exec(recent);
+  if (exact) return Number(exact[1]);
+  const range = /大约需要\s*(\d+)\s*[-–—至]\s*(\d+)\s*分钟/.exec(recent);
+  return range ? Math.max(Number(range[1]), Number(range[2])) : 0;
+}
+
+function generationFailure(bodyText: string) {
+  const match = /(视频|图片)?(?:生成)?(?:失败|未通过审核|审核未通过|涉嫌违规|内容违规|请求失败|出错了)/.exec(bodyText.slice(-6_000));
+  return match ? `豆包报告生成失败：${match[0]}` : "";
+}
+
+async function openLatestVideoPreview(win: BrowserWindow) {
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const cards = Array.from(document.querySelectorAll('[class*="block-video"]'));
+      const element = cards[cards.length - 1];
+      if (!element) return null;
+      const rect = element.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (!point) throw new Error("已检测到视频完成，但没有找到最新视频卡片");
+  await clickPoint(win, point.x, point.y);
+  await waitUntil(async () => {
+    await pauseAndMuteVideos(win);
+    return hasDownloadControl(win);
+  }, 15_000, 400);
+}
+
+async function pauseAndMuteVideos(win: BrowserWindow) {
+  await win.webContents.executeJavaScript(`
+    (() => {
+      document.querySelectorAll('video').forEach(video => {
+        video.muted = true;
+        video.pause();
+        video.removeAttribute('autoplay');
+        video.loop = false;
+      });
+    })()
+  `, true);
+}
+
+async function hasDownloadControl(win: BrowserWindow) {
+  return win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      return Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]')).filter(visible).some(element => /下载/.test((element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, '')));
+    })()
+  `, true) as Promise<boolean>;
+}
+
+async function clickOfficialDownloadControl(win: BrowserWindow, onStarted: () => boolean) {
+  if (await clickVisibleText(win, ["下载原片"], true)) return true;
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]')).filter(visible).map(element => {
+        const text = (element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, '').trim();
+        const rect = element.getBoundingClientRect();
+        return { text, x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), area: rect.width * rect.height };
+      }).filter(item => /^下载(?:原片|视频)?$/.test(item.text)).sort((a, b) => a.area - b.area);
+      return candidates[0] || null;
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (!point) return false;
+  await clickPoint(win, point.x, point.y);
+  await delay(500);
+  if (!onStarted() && await hasVisibleText(win, ["下载原片"], true)) await clickVisibleText(win, ["下载原片"], true);
+  return true;
+}
+
+async function downloadOfficialOriginal(win: BrowserWindow, outputFolder: string, baseName: string): Promise<DownloadedGenerationCandidate> {
+  mkdirSync(outputFolder, { recursive: true });
+  const finalPath = uniqueDownloadPath(path.join(outputFolder, `${baseName}.mp4`));
+  await openLatestVideoPreview(win);
+  const first = await runOfficialDownloadAttempt(win, `${finalPath}.attempt1.mp4`);
+  let selected = first;
+  if (videoSourceHasWatermark(first.sourceUrl)) {
+    const second = await runOfficialDownloadAttempt(win, `${finalPath}.attempt2.mp4`);
+    if (!videoSourceHasWatermark(second.sourceUrl)) selected = second;
+    else selected = second;
+  }
+  for (const attempt of [first, selected]) {
+    if (attempt.filePath !== selected.filePath && existsSync(attempt.filePath)) unlinkSync(attempt.filePath);
+  }
+  if (!existsSync(selected.filePath) || statSync(selected.filePath).size <= 0) throw new Error("官方下载完成但文件校验失败，下载页已保留");
+  renameSync(selected.filePath, finalPath);
+  await pauseAndMuteVideos(win);
+  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  win.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+  await delay(250);
+  return { sourceUrl: selected.sourceUrl, filePath: finalPath, hasWatermark: videoSourceHasWatermark(selected.sourceUrl) };
+}
+
+async function runOfficialDownloadAttempt(win: BrowserWindow, savePath: string) {
+  if (existsSync(savePath)) unlinkSync(savePath);
+  const downloadSession = win.webContents.session;
+  let started = false;
+  let listener: ((_event: Event, item: DownloadItem) => void) | null = null;
+  const download = new Promise<{ sourceUrl: string; filePath: string }>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      if (listener) downloadSession.removeListener("will-download", listener);
+      reject(new Error("点击官方下载入口后 30 秒内没有收到下载任务，下载页已保留"));
+    }, 30_000);
+    listener = (_event, item) => {
+      started = true;
+      clearTimeout(timeout);
+      item.setSavePath(savePath);
+      item.once("done", (_doneEvent, state) => {
+        if (state !== "completed") reject(new Error(`官方下载失败（${state}），下载页已保留`));
+        else resolve({ sourceUrl: item.getURL(), filePath: savePath });
+      });
+    };
+    downloadSession.once("will-download", listener);
+  });
+  if (!await clickOfficialDownloadControl(win, () => started)) {
+    if (listener) downloadSession.removeListener("will-download", listener);
+    throw new Error("下载页没有找到官方“下载原片”入口，页面已保留");
+  }
+  return download;
+}
+
+function uniqueDownloadPath(target: string) {
+  if (!existsSync(target)) return target;
+  const extension = path.extname(target);
+  const stem = target.slice(0, -extension.length);
+  let index = 2;
+  while (existsSync(`${stem}_${index}${extension}`)) index += 1;
+  return `${stem}_${index}${extension}`;
 }
 
 function delay(milliseconds: number) {

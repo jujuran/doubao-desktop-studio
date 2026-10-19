@@ -1,9 +1,26 @@
 export type AccountStatus = "login_required" | "ready" | "busy" | "error";
-export type TaskStatus = "queued" | "submitted" | "running" | "succeeded" | "failed" | "cancelled";
+export type TaskStatus = "queued" | "submitted" | "running" | "review" | "succeeded" | "failed" | "cancelled";
 export type ImageTaskStatus = "pending" | "preparing" | "submitted" | "ready" | "approved" | "failed" | "skipped";
 export type FirstFrameSource = "local" | "generated" | "none";
 export type UsageKind = "image" | "video";
 export type ParameterSource = "shot" | "project" | "first_frame" | "default";
+export type PreparationState = "idle" | "running" | "ready" | "failed";
+export type MediaCandidateKind = "image" | "video";
+export type MediaReviewStatus = "pending" | "approved" | "rejected";
+
+export interface MediaCandidate {
+  id: string;
+  taskId: string;
+  kind: MediaCandidateKind;
+  generationIndex: number;
+  candidateIndex: number;
+  sourceUrl: string;
+  filePath: string;
+  previewUrl: string;
+  reviewStatus: MediaReviewStatus;
+  hasWatermark: boolean;
+  createdAt: string;
+}
 
 export interface Account {
   id: string;
@@ -24,6 +41,7 @@ export interface TaskRecord {
   shotName: string;
   narration: string;
   notes: string;
+  generationCount: number;
   firstFrameSource: FirstFrameSource;
   firstFrameFileName: string | null;
   imagePrompt: string;
@@ -42,6 +60,14 @@ export interface TaskRecord {
   resultUrl: string | null;
   resultPath: string | null;
   errorMessage: string | null;
+  imagePrepareState: PreparationState;
+  imagePrepareStep: string;
+  imagePrepareMessage: string | null;
+  videoPrepareState: PreparationState;
+  videoPrepareStep: string;
+  videoPrepareMessage: string | null;
+  imageCandidates: MediaCandidate[];
+  videoCandidates: MediaCandidate[];
   createdAt: string;
   updatedAt: string;
 }
@@ -53,6 +79,7 @@ export interface TaskInput extends Pick<
   shotName?: string;
   narration?: string;
   notes?: string;
+  generationCount?: number;
   modelSource?: ParameterSource;
   durationSource?: ParameterSource;
   aspectRatioSource?: ParameterSource;
@@ -75,21 +102,31 @@ export interface AssignmentSummary {
 
 export type ProjectReferenceKind = "character" | "scene" | "style";
 
-export interface ProjectStyleProfile {
+export interface ProjectStyleInput {
   projectName: string;
   globalPrompt: string;
   imageGlobalPrompt: string;
   videoGlobalPrompt: string;
   migrationPending: boolean;
-  characterReferencePath: string | null;
+  characterReferencePaths: string[];
+  characterReferenceNames?: string[];
   sceneReferencePath: string | null;
+  sceneReferenceName?: string | null;
   styleReferencePath: string | null;
+  styleReferenceName?: string | null;
+  outputDirectory?: string | null;
   lockedModel: string | null;
   lockedAspectRatio: string | null;
-  updatedAt: string;
 }
 
-export type ProjectStyleInput = Omit<ProjectStyleProfile, "updatedAt">;
+export interface ProjectStyleProfile extends ProjectStyleInput {
+  characterReferenceHashes: string[];
+  characterReferenceNames: string[];
+  sceneReferenceName: string | null;
+  styleReferenceName: string | null;
+  outputDirectory: string | null;
+  updatedAt: string;
+}
 
 export interface AssetFolderFile {
   name: string;
@@ -108,6 +145,7 @@ export interface AssetFolderSelection {
 export interface AppSettings {
   maxActiveWorkers: number;
   automationEnabled: boolean;
+  autoClickGenerate: boolean;
   lastTaskAccountId: string | null;
   lastVideoModel: string;
   lastVideoDuration: number;
@@ -166,6 +204,11 @@ export interface DesktopApi {
     openImage(id: string): Promise<TaskRecord>;
     chooseImage(id: string): Promise<TaskRecord | null>;
     updateImageStatus(id: string, status: ImageTaskStatus): Promise<TaskRecord>;
+    approveImageCandidate(id: string): Promise<TaskRecord>;
+    reviewVideoCandidate(id: string, approved: boolean): Promise<TaskRecord>;
+    recheckDownload(id: string): Promise<TaskRecord>;
+    importVideoCandidate(id: string): Promise<TaskRecord | null>;
+    openCandidateFolder(id: string): Promise<void>;
     autoAssign(): Promise<AssignmentSummary>;
     open(id: string): Promise<TaskRecord>;
     updateStatus(id: string, status: TaskStatus): Promise<TaskRecord>;
@@ -177,7 +220,8 @@ export interface DesktopApi {
   projects: {
     listStyles(): Promise<ProjectStyleProfile[]>;
     saveStyle(input: ProjectStyleInput): Promise<ProjectStyleProfile>;
-    chooseReference(kind: ProjectReferenceKind): Promise<string | null>;
+    chooseReference(kind: ProjectReferenceKind): Promise<string[]>;
+    chooseOutputDirectory(): Promise<string | null>;
     applyLocks(projectName: string): Promise<number>;
   };
   imports: {

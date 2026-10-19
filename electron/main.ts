@@ -1,6 +1,6 @@
 import path from "node:path";
 import { readdirSync, writeFileSync } from "node:fs";
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, shell } from "electron";
 import type {
   AppSettings,
   ImageTaskStatus,
@@ -28,6 +28,7 @@ let mainWindow: BrowserWindow | null = null;
 let database: StudioDatabase;
 let diagnostics: DiagnosticsLogger;
 let sessions: AccountSessionManager;
+const activeGenerationMonitors = new Set<string>();
 
 function createMainWindow() {
   const win = new BrowserWindow({
@@ -154,16 +155,34 @@ function registerIpc() {
   });
   ipcMain.handle("tasks:open-image", async (_event, id: string) => {
     const task = database.getTask(id);
-    if (task.firstFrameSource !== "generated") throw new Error("这个分镜不是提示词生成首帧");
-    if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
-    if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
-    const account = database.getAccount(task.imageAccountId);
-    const finalPrompt = composeDeliveryPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
-    clipboard.writeText(finalPrompt);
-    database.setTaskImageStatus(id, "preparing");
+    database.setTaskPreparation(id, "image", "running", "检查前置条件");
     notifyChanged();
-    await sessions.prepare(account, "image", finalPrompt, null, undefined, task.aspectRatio);
-    return database.getTask(id);
+    try {
+      if (task.firstFrameSource !== "generated") throw new Error("这个分镜不是提示词生成首帧");
+      if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
+      if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
+      const account = database.getAccount(task.imageAccountId);
+      const finalPrompt = composeDeliveryPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
+      clipboard.writeText(finalPrompt);
+      database.setTaskImageStatus(id, "preparing");
+      database.setTaskPreparation(id, "image", "running", "打开生图页");
+      notifyChanged();
+      await sessions.prepare(account, "image", finalPrompt, null, undefined, task.aspectRatio, (progress) => {
+        database.setTaskPreparation(id, "image", progress.state, progress.step);
+        notifyChanged();
+      });
+      const updated = database.setTaskPreparation(id, "image", "ready", "已就绪（请到豆包点生成）");
+      startGenerationMonitor(id, "image", account.id, finalPrompt);
+      notifyChanged();
+      return updated;
+    } catch (error) {
+      const message = errorMessage(error);
+      const current = database.getTask(id);
+      if (task.firstFrameSource === "generated") database.setTaskImageStatus(id, "failed");
+      const updated = database.setTaskPreparation(id, "image", "failed", current.imagePrepareStep || "打开生图页", message);
+      notifyChanged();
+      throw Object.assign(new Error(message), { task: updated });
+    }
   });
   ipcMain.handle("tasks:choose-image", async (event, id: string) => {
     database.getTask(id);
@@ -188,42 +207,74 @@ function registerIpc() {
     notifyChanged();
     return task;
   });
+  ipcMain.handle("tasks:approve-image-candidate", async (_event, candidateId: string) => {
+    let task = database.approveImageCandidate(candidateId);
+    notifyChanged();
+    if (database.getSettings().autoClickGenerate) task = await prepareVideoTask(task.id);
+    return task;
+  });
+  ipcMain.handle("tasks:review-video-candidate", (_event, candidateId: string, approved: boolean) => {
+    const task = database.reviewVideoCandidate(candidateId, approved);
+    notifyChanged();
+    return task;
+  });
+  ipcMain.handle("tasks:recheck-download", async (_event, id: string) => {
+    const task = database.getTask(id);
+    if (!task.accountId) throw new Error("请先为任务选择账号");
+    const account = database.getAccount(task.accountId);
+    const target = database.generationTarget(id, "video", account.label);
+    database.setTaskPreparation(id, "video", "running", "重新检查并下载");
+    notifyChanged();
+    try {
+      const item = await sessions.downloadLatestVideo(account, target.folder, target.baseName);
+      database.addTaskCandidates(id, "video", target.generationIndex, [item]);
+      database.setTaskStatus(id, "review", null);
+      const watermarkNote = item.hasWatermark ? "（下载地址仍标记为平台水印，请人工核对）" : "";
+      const updated = database.setTaskPreparation(id, "video", "ready", `原视频已下载，等待审核${watermarkNote}`);
+      notifyChanged();
+      return updated;
+    } catch (error) {
+      const message = errorMessage(error);
+      database.setTaskStatus(id, "failed", message);
+      const updated = database.setTaskPreparation(id, "video", "failed", "重新检查并下载失败", message);
+      notifyChanged();
+      throw Object.assign(new Error(message), { task: updated });
+    }
+  });
+  ipcMain.handle("tasks:import-video-candidate", async (event, id: string) => {
+    const task = database.getTask(id);
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "导入已生成的视频候选",
+      buttonLabel: "导入候选",
+      properties: ["openFile"],
+      filters: [{ name: "MP4 视频", extensions: ["mp4"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    const accountLabel = task.accountId ? database.getAccount(task.accountId).label : "未分配账号";
+    const updated = database.importVideoCandidate(id, result.filePaths[0], accountLabel);
+    notifyChanged();
+    return updated;
+  });
+  ipcMain.handle("tasks:open-candidate-folder", (_event, candidateId: string) => {
+    shell.showItemInFolder(database.candidateFilePath(candidateId));
+  });
   ipcMain.handle("tasks:auto-assign", () => {
     const summary = database.autoAssignTasks();
     notifyChanged();
     return summary;
   });
-  ipcMain.handle("tasks:open", async (_event, id: string) => {
-    const task = database.getTask(id);
-    try {
-      if (!task.accountId) throw new Error("请先为任务选择账号");
-      if (task.firstFrameSource !== "none" && task.imageStatus !== "approved") throw new Error("请先锁定首帧，再制作分镜视频");
-      if (task.firstFrameSource !== "none" && !task.imagePath) throw new Error("首帧文件不存在，请重新选择或生成首帧");
-      const account = database.getAccount(task.accountId);
-      const finalPrompt = composeDeliveryPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
-      clipboard.writeText(finalPrompt);
-      diagnostics.info("video_task_prepare_started", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
-      await sessions.prepare(
-        account,
-        "video",
-        finalPrompt,
-        task.firstFrameSource === "none" ? null : task.imagePath,
-        { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio }
-      );
-      const updated = database.setTaskStatus(id, task.status === "failed" ? "queued" : task.status, null);
-      diagnostics.info("video_task_prepare_completed", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
-      notifyChanged();
-      return updated;
-    } catch (error) {
-      const message = errorMessage(error);
-      const updated = database.setTaskStatus(id, "failed", message);
-      diagnostics.error("video_task_prepare_failed", { taskId: shortTaskId(id), message });
-      notifyChanged();
-      throw Object.assign(new Error(message), { task: updated });
-    }
-  });
+  ipcMain.handle("tasks:open", async (_event, id: string) => prepareVideoTask(id));
   ipcMain.handle("tasks:update-status", (_event, id: string, status: TaskStatus) => {
-    const task = database.setTaskStatus(id, status);
+    let task = database.setTaskStatus(id, status);
+    if (status === "running") {
+      if (!task.accountId) throw new Error("请先为任务选择账号");
+      const finalPrompt = composeDeliveryPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
+      startGenerationMonitor(id, "video", task.accountId, finalPrompt);
+      task = database.setTaskPreparation(id, "video", "running", "继续监听豆包生成结果");
+    }
+    if (status === "succeeded") task = database.setTaskPreparation(id, "video", "ready", "已手动标记完成");
     notifyChanged();
     return task;
   });
@@ -251,9 +302,19 @@ function registerIpc() {
     };
     const options: Electron.OpenDialogOptions = {
       title: titles[kind],
-      buttonLabel: "使用这张参考图",
-      properties: ["openFile"],
+      buttonLabel: kind === "character" ? "使用这些参考图" : "使用这张参考图",
+      properties: kind === "character" ? ["openFile", "multiSelections"] : ["openFile"],
       filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    return result.canceled ? [] : result.filePaths;
+  });
+  ipcMain.handle("projects:choose-output-directory", async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "选择此项目的输出目录",
+      buttonLabel: "使用此目录",
+      properties: ["openDirectory", "createDirectory"]
     };
     const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
     return result.canceled ? null : result.filePaths[0] ?? null;
@@ -370,6 +431,116 @@ function registerIpc() {
     diagnostics.info("diagnostics_exported");
     return { cancelled: false, filePath: result.filePath, message: `诊断信息已导出：${result.filePath}` };
   });
+}
+
+async function prepareVideoTask(id: string) {
+  const task = database.getTask(id);
+  database.setTaskPreparation(id, "video", "running", "检查前置条件");
+  notifyChanged();
+  try {
+    if (!task.accountId) throw new Error("请先为任务选择账号");
+    if (task.firstFrameSource !== "none" && task.imageStatus !== "approved") throw new Error("请先锁定首帧，再制作分镜视频");
+    if (task.firstFrameSource !== "none" && !task.imagePath) throw new Error("首帧文件不存在，请重新选择或生成首帧");
+    const account = database.getAccount(task.accountId);
+    const finalPrompt = composeDeliveryPrompt("video", task.prompt, database.getProjectStyle(task.projectName));
+    clipboard.writeText(finalPrompt);
+    diagnostics.info("video_task_prepare_started", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
+    database.setTaskPreparation(id, "video", "running", "打开视频页");
+    notifyChanged();
+    await sessions.prepare(
+      account,
+      "video",
+      finalPrompt,
+      task.firstFrameSource === "none" ? null : task.imagePath,
+      { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio },
+      undefined,
+      (progress) => {
+        database.setTaskPreparation(id, "video", progress.state, progress.step);
+        notifyChanged();
+      }
+    );
+    database.setTaskStatus(id, task.status === "failed" ? "queued" : task.status, null);
+    const updated = database.setTaskPreparation(id, "video", "ready", "已就绪（请到豆包点生成）");
+    startGenerationMonitor(id, "video", account.id, finalPrompt);
+    diagnostics.info("video_task_prepare_completed", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
+    notifyChanged();
+    return updated;
+  } catch (error) {
+    const message = errorMessage(error);
+    database.setTaskStatus(id, "failed", message);
+    const current = database.getTask(id);
+    const updated = database.setTaskPreparation(id, "video", "failed", current.videoPrepareStep || "打开视频页", message);
+    diagnostics.error("video_task_prepare_failed", { taskId: shortTaskId(id), message });
+    notifyChanged();
+    throw Object.assign(new Error(message), { task: updated });
+  }
+}
+
+function startGenerationMonitor(taskId: string, route: "image" | "video", accountId: string, prompt: string) {
+  const monitorKey = `${taskId}:${route}`;
+  if (activeGenerationMonitors.has(monitorKey)) return;
+  activeGenerationMonitors.add(monitorKey);
+  const task = database.getTask(taskId);
+  const account = database.getAccount(accountId);
+  const target = database.generationTarget(taskId, route, account.label);
+  const autoClick = database.getSettings().autoClickGenerate;
+  void sessions.monitorGeneration(account, {
+    route,
+    prompt,
+    outputFolder: target.folder,
+    baseName: target.baseName,
+    generationIndex: target.generationIndex,
+    autoClick,
+    imageAspectRatio: route === "image" ? task.aspectRatio : undefined,
+    videoSettings: route === "video" ? { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio } : undefined,
+    expectsFirstFrame: route === "video" && task.firstFrameSource !== "none",
+    onProgress(state, step) {
+      try {
+        if (state === "waiting") database.setTaskPreparation(taskId, route, "ready", step);
+        if (state === "started" && route === "image") {
+          database.setTaskImageStatus(taskId, "submitted");
+          database.setTaskPreparation(taskId, route, "running", step);
+        }
+        if (state === "started" && route === "video") {
+          let current = database.getTask(taskId);
+          if (current.status !== "submitted" && current.status !== "running") {
+            if (!["queued", "failed", "cancelled"].includes(current.status)) {
+              current = database.setTaskStatus(taskId, "queued", null);
+            }
+            database.setTaskStatus(taskId, "submitted", null);
+          }
+          database.setTaskStatus(taskId, "running", null);
+          database.setTaskPreparation(taskId, route, "running", step);
+        }
+        if (state === "completed") database.setTaskPreparation(taskId, route, "running", step);
+        notifyChanged();
+      } catch (error) {
+        diagnostics.warn("generation_progress_update_failed", { taskId: shortTaskId(taskId), route, message: errorMessage(error) });
+      }
+    }
+  }).then((items) => {
+    database.addTaskCandidates(taskId, route, target.generationIndex, items);
+    if (route === "image") {
+      database.setTaskImageStatus(taskId, "ready");
+      database.setTaskPreparation(taskId, route, "ready", `已下载 ${items.length} 张候选图，等待审核`);
+    } else {
+      database.setTaskStatus(taskId, "review", null);
+      const watermarkNote = items.some((item) => item.hasWatermark) ? "（豆包当前下载文件含平台水印）" : "";
+      database.setTaskPreparation(taskId, route, "ready", `原视频已下载，等待审核${watermarkNote}`);
+    }
+    diagnostics.info("generation_download_completed", { taskId: shortTaskId(taskId), route, candidateCount: items.length });
+    notifyChanged();
+  }).catch((error) => {
+    const message = errorMessage(error);
+    if (route === "image") {
+      try { database.setTaskImageStatus(taskId, "failed"); } catch {}
+    } else {
+      database.setTaskStatus(taskId, "failed", message);
+    }
+    database.setTaskPreparation(taskId, route, "failed", route === "image" ? "生图或下载失败" : "视频生成或下载失败", message);
+    diagnostics.error("generation_monitor_failed", { taskId: shortTaskId(taskId), route, message });
+    notifyChanged();
+  }).finally(() => activeGenerationMonitors.delete(monitorKey));
 }
 
 app.whenReady().then(() => {

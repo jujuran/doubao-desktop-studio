@@ -22,6 +22,11 @@ contextBridge.exposeInMainWorld("desktopApi", {
     openImage: (id) => ipcRenderer.invoke("tasks:open-image", id),
     chooseImage: (id) => ipcRenderer.invoke("tasks:choose-image", id),
     updateImageStatus: (id, status) => ipcRenderer.invoke("tasks:update-image-status", id, status),
+    approveImageCandidate: (id) => ipcRenderer.invoke("tasks:approve-image-candidate", id),
+    reviewVideoCandidate: (id, approved) => ipcRenderer.invoke("tasks:review-video-candidate", id, approved),
+    recheckDownload: (id) => ipcRenderer.invoke("tasks:recheck-download", id),
+    importVideoCandidate: (id) => ipcRenderer.invoke("tasks:import-video-candidate", id),
+    openCandidateFolder: (id) => ipcRenderer.invoke("tasks:open-candidate-folder", id),
     autoAssign: () => ipcRenderer.invoke("tasks:auto-assign"),
     open: (id) => ipcRenderer.invoke("tasks:open", id),
     updateStatus: (id, status) => ipcRenderer.invoke("tasks:update-status", id, status)
@@ -34,6 +39,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
     listStyles: () => ipcRenderer.invoke("projects:list-styles"),
     saveStyle: (input) => ipcRenderer.invoke("projects:save-style", input),
     chooseReference: (kind) => ipcRenderer.invoke("projects:choose-reference", kind),
+    chooseOutputDirectory: () => ipcRenderer.invoke("projects:choose-output-directory"),
     applyLocks: (projectName) => ipcRenderer.invoke("projects:apply-locks", projectName)
   },
   imports: {

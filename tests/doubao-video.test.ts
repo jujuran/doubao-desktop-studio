@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareDoubaoVideoSettings, concreteDuration, doubaoAspectRatio, durationToSliderValue, isDoubaoVideoModeActive, normalizeComposerText, normalizedModelName, parseDoubaoImageAspectText, parseDoubaoVideoParameterText } from "../src/doubao-video";
+import { compareDoubaoVideoSettings, concreteDuration, doubaoAspectRatio, durationToSliderValue, isDoubaoVideoModeActive, normalizeComposerText, normalizedModelName, parseDoubaoImageAspectText, parseDoubaoVideoParameterText, videoSourceHasWatermark } from "../src/doubao-video";
 
 describe("Doubao video setting verification", () => {
   it("normalizes labels shown by Doubao", () => {
@@ -58,5 +58,20 @@ describe("Doubao video setting verification", () => {
       composerPlaceholders: ["有什么我能帮你的吗？"],
       controlTexts: []
     })).toBe(false);
+  });
+
+  it("recognizes the selected AI creation video tab", () => {
+    expect(isDoubaoVideoModeActive({
+      modeLabels: ["视频"],
+      composerPlaceholders: [],
+      controlTexts: ["模型 Seedance 2.0 Mini", "16:9 · 4s"]
+    })).toBe(true);
+  });
+
+  it("does not mistake an unwatermarked rendition for a watermarked video", () => {
+    expect(videoSourceHasWatermark("https://v26-vdl.doubao.com/video.mp4?lr=unwatermarked")).toBe(false);
+    expect(videoSourceHasWatermark("https://example.com/video_gen_watermark_dyn/video.mp4")).toBe(true);
+    expect(videoSourceHasWatermark("https://example.com/video.mp4?lr=watermarked")).toBe(true);
+    expect(videoSourceHasWatermark("https://example.com/video.mp4")).toBe(false);
   });
 });

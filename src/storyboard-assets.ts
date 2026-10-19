@@ -14,6 +14,12 @@ export interface StoryboardAssetResolution {
   hasErrors: boolean;
 }
 
+export interface ProjectReferenceResolution {
+  files: AssetFolderFile[];
+  missing: string[];
+  hasErrors: boolean;
+}
+
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
 
 export function resolveStoryboardAssets(shots: ImportedShot[], files: AssetFolderFile[]): StoryboardAssetResolution {
@@ -47,6 +53,22 @@ export function resolveStoryboardAssets(shots: ImportedShot[], files: AssetFolde
     unusedFiles: files.filter((file) => !used.has(file.path)),
     hasErrors: resolved.some((item) => Boolean(item.error))
   };
+}
+
+export function resolveProjectReferenceAssets(names: string[], files: AssetFolderFile[]): ProjectReferenceResolution {
+  const resolved: AssetFolderFile[] = [];
+  const missing: string[] = [];
+  for (const name of names) {
+    if (isAbsolutePath(name)) {
+      const match = files.find((file) => normalizePath(file.path) === normalizePath(name));
+      resolved.push(match ?? { name: normalizeName(name), path: name, width: 0, height: 0, thumbnailUrl: "" });
+      continue;
+    }
+    const matches = files.filter((file) => normalizeName(file.name) === normalizeName(name));
+    if (matches.length === 1) resolved.push(matches[0]);
+    else missing.push(matches.length ? `${name}（匹配到多张）` : name);
+  }
+  return { files: resolved, missing, hasErrors: missing.length > 0 };
 }
 
 function findCandidates(shot: ImportedShot, files: AssetFolderFile[]) {

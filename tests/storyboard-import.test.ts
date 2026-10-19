@@ -107,4 +107,36 @@ describe("storyboard import", () => {
     const result = parseStoryboard("### 分镜 1\n视频提示词：测试\n画幅：自动");
     expect(result.shots[0]).toMatchObject({ modelExplicit: false, durationExplicit: false, aspectRatioExplicit: true, aspectRatio: "adaptive" });
   });
+
+  it("supports the finalized v1 project defaults, generation count and character references", () => {
+    const result = parseStoryboard(`
+格式版本：1
+项目名称：协议测试
+默认模型：Seedance 2.5
+默认时长：8秒
+默认画幅：16:9
+角色参考图：豆豆_正面.png，豆豆_侧面.png, 豆豆_正面.png
+### 分镜 1
+镜头名：抬头
+生成次数：3
+视频提示词：柯基抬头
+### 分镜 2
+视频提示词：柯基跑动
+时长：6秒
+`);
+    expect(result).toMatchObject({
+      formatVersion: 1,
+      defaultModel: "Seedance 2.5",
+      defaultDuration: 8,
+      defaultAspectRatio: "16:9",
+      characterReferenceImages: ["豆豆_正面.png", "豆豆_侧面.png"]
+    });
+    expect(result.shots[0]).toMatchObject({ model: "Seedance 2.5", duration: 8, aspectRatio: "16:9", generationCount: 3 });
+    expect(result.shots[1]).toMatchObject({ duration: 6, durationExplicit: true, generationCount: 1 });
+  });
+
+  it("rejects an unsupported import protocol version", () => {
+    expect(() => parseStoryboard("格式版本：2\n### 分镜 1\n视频提示词：测试"))
+      .toThrow(/不支持格式版本 2/);
+  });
 });

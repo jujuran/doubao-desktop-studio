@@ -6,6 +6,7 @@ export interface ImportedShot {
   shotName: string;
   narration: string;
   notes: string;
+  generationCount: number;
   firstFrameSource: FirstFrameSource;
   firstFrameImage: string;
   imagePrompt: string;
@@ -26,10 +27,15 @@ export interface StoryboardImportWarning {
 }
 
 export interface ImportedStoryboard {
+  formatVersion: number;
   projectName: string;
   globalPrompt: string;
   imageGlobalPrompt: string;
   videoGlobalPrompt: string;
+  defaultModel: string;
+  defaultDuration: number;
+  defaultAspectRatio: string;
+  characterReferenceImages: string[];
   shots: ImportedShot[];
   warnings: StoryboardImportWarning[];
 }
@@ -41,6 +47,7 @@ const fieldAliases = {
   shotName: ["shotName", "shot_name", "镜头名", "分镜名"],
   narration: ["narration", "voiceover", "voice_over", "口播", "旁白"],
   notes: ["notes", "note", "备注"],
+  generationCount: ["generationCount", "generation_count", "生成次数", "候选数"],
   firstFrameSource: ["firstFrameSource", "first_frame_source", "首帧来源"],
   firstFrameImage: ["firstFrameImage", "first_frame_image", "首帧图", "首帧图片"],
   imagePrompt: ["imagePrompt", "image_prompt", "分镜图提示词", "图片提示词", "生图提示词"],
@@ -51,9 +58,14 @@ const fieldAliases = {
 } as const;
 
 const projectFieldAliases = {
+  formatVersion: ["formatVersion", "format_version", "格式版本"],
   globalPrompt: ["globalPrompt", "global_prompt", "全局提示词"],
   imageGlobalPrompt: ["imageGlobalPrompt", "image_global_prompt", "全局分镜图提示词", "全局生图提示词"],
-  videoGlobalPrompt: ["videoGlobalPrompt", "video_global_prompt", "全局视频提示词"]
+  videoGlobalPrompt: ["videoGlobalPrompt", "video_global_prompt", "全局视频提示词"],
+  defaultModel: ["defaultModel", "default_model", "默认模型"],
+  defaultDuration: ["defaultDuration", "default_duration", "默认时长"],
+  defaultAspectRatio: ["defaultAspectRatio", "default_aspect_ratio", "默认画幅", "默认比例"],
+  characterReferenceImages: ["characterReferenceImages", "character_reference_images", "characterReferenceImage", "角色参考图"]
 } as const;
 
 const COMMON_PROMPT_LABELS = new Set([
@@ -85,12 +97,19 @@ function parseJsonStoryboard(text: string, fallbackProjectName: string): Importe
   const candidates = root.shots ?? root.storyboard ?? root.分镜 ?? root.镜头;
   if (!Array.isArray(candidates)) throw new Error("JSON 中没有找到 shots（分镜数组）");
   const projectName = stringValue(root.projectName ?? root.project ?? root.项目名称 ?? root.视频名称) || fallbackProjectName.trim();
+  const formatVersion = normalizeFormatVersion(pick(root, projectFieldAliases.formatVersion));
+  const defaults = normalizeProjectDefaults(root);
   return finalize({
+    formatVersion,
     projectName,
     globalPrompt: stringValue(pick(root, projectFieldAliases.globalPrompt)),
     imageGlobalPrompt: stringValue(pick(root, projectFieldAliases.imageGlobalPrompt)),
     videoGlobalPrompt: stringValue(pick(root, projectFieldAliases.videoGlobalPrompt)),
-    shots: candidates.map((item, index) => normalizeShot(asRecord(item), index + 1)),
+    defaultModel: defaults.model,
+    defaultDuration: defaults.duration,
+    defaultAspectRatio: defaults.aspectRatio,
+    characterReferenceImages: referenceList(pick(root, projectFieldAliases.characterReferenceImages)),
+    shots: candidates.map((item, index) => normalizeShot(asRecord(item), index + 1, defaults)),
     warnings: []
   });
 }
@@ -99,7 +118,7 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
   const lines = text.split(/\r?\n/);
   let projectName = fallbackProjectName.trim();
   const projectFields: LooseRecord = {};
-  const shots: ImportedShot[] = [];
+  const rawShots: LooseRecord[] = [];
   const suspiciousByShot = new Map<string, { lineNumber: number; shotNumber: number | null; labels: Set<string> }>();
   let current: LooseRecord | null = null;
   let activeField: keyof typeof fieldAliases | null = null;
@@ -107,7 +126,7 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
 
   const flush = () => {
     if (!current) return;
-    shots.push(normalizeShot(current, shots.length + 1));
+    rawShots.push(current);
     current = null;
     activeField = null;
     activeProjectField = null;
@@ -120,7 +139,7 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
       projectName = cleanMarkdown(projectMatch[1]);
       continue;
     }
-    const projectFieldMatch = line.match(/^(?:[-*]\s*)?(全局提示词|全局分镜图提示词|全局生图提示词|全局视频提示词|global\s*prompt|image\s*global\s*prompt|video\s*global\s*prompt)\s*[:：]\s*(.*)$/i);
+    const projectFieldMatch = line.match(/^(?:[-*]\s*)?(格式版本|format\s*version|全局提示词|全局分镜图提示词|全局生图提示词|全局视频提示词|global\s*prompt|image\s*global\s*prompt|video\s*global\s*prompt|默认模型|default\s*model|默认时长|default\s*duration|默认画幅|默认比例|default\s*aspect\s*ratio|角色参考图|character\s*reference\s*images?)\s*[:：]\s*(.*)$/i);
     if (projectFieldMatch && !current) {
       activeProjectField = projectAliasKey(projectFieldMatch[1]);
       projectFields[activeProjectField] = cleanMarkdown(projectFieldMatch[2]);
@@ -134,9 +153,9 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
       activeProjectField = null;
       continue;
     }
-    const fieldMatch = line.match(/^(?:[-*]\s*)?(镜头名|分镜名|shot\s*name|口播|旁白|narration|voice\s*over|备注|notes?|首帧来源|first\s*frame\s*source|首帧图|首帧图片|first\s*frame\s*image|分镜图提示词|图片提示词|生图提示词|image\s*prompt|分镜视频提示词|视频提示词|video\s*prompt|模型|model|时长|秒数|duration|画幅|比例|aspect\s*ratio)\s*[:：]\s*(.*)$/i);
+    const fieldMatch = line.match(/^(?:[-*]\s*)?(镜头名|分镜名|shot\s*name|口播|旁白|narration|voice\s*over|备注|notes?|生成次数|候选数|generation\s*count|首帧来源|first\s*frame\s*source|首帧图|首帧图片|first\s*frame\s*image|分镜图提示词|图片提示词|生图提示词|image\s*prompt|分镜视频提示词|视频提示词|video\s*prompt|模型|model|时长|秒数|duration|画幅|比例|aspect\s*ratio)\s*[:：]\s*(.*)$/i);
     if (fieldMatch) {
-      if (!current) current = { shotNumber: shots.length + 1 };
+      if (!current) current = { shotNumber: rawShots.length + 1 };
       activeField = aliasKey(fieldMatch[1]);
       current[activeField] = cleanMarkdown(fieldMatch[2]);
       activeProjectField = null;
@@ -144,7 +163,7 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
     }
     const suspiciousField = line.match(/^(?:[-*]\s*)?([^:：]{1,24})\s*[:：]\s*(.*)$/);
     if (suspiciousField && ((current && activeField) || (!current && activeProjectField)) && isLikelyMistypedField(suspiciousField[1])) {
-      const shotNumber = current ? positiveInteger(current.shotNumber) || shots.length + 1 : null;
+      const shotNumber = current ? positiveInteger(current.shotNumber) || rawShots.length + 1 : null;
       const key = shotNumber == null ? "project" : `shot-${shotNumber}`;
       const entry = suspiciousByShot.get(key) ?? { lineNumber: lineIndex + 1, shotNumber, labels: new Set<string>() };
       entry.labels.add(suspiciousField[1].trim());
@@ -171,12 +190,19 @@ function parseMarkdownStoryboard(text: string, fallbackProjectName: string): Imp
       message: `${scope}：疑似字段“${labels.join("、")}”（内容已保留在提示词正文中）`
     };
   });
+  const formatVersion = normalizeFormatVersion(projectFields.formatVersion);
+  const defaults = normalizeProjectDefaults(projectFields);
   return finalize({
+    formatVersion,
     projectName,
     globalPrompt: stringValue(projectFields.globalPrompt),
     imageGlobalPrompt: stringValue(projectFields.imageGlobalPrompt),
     videoGlobalPrompt: stringValue(projectFields.videoGlobalPrompt),
-    shots,
+    defaultModel: defaults.model,
+    defaultDuration: defaults.duration,
+    defaultAspectRatio: defaults.aspectRatio,
+    characterReferenceImages: referenceList(projectFields.characterReferenceImages),
+    shots: rawShots.map((record, index) => normalizeShot(record, index + 1, defaults)),
     warnings
   });
 }
@@ -213,11 +239,16 @@ function editDistance(left: string, right: string) {
   return row[right.length];
 }
 
-function normalizeShot(record: LooseRecord, fallbackNumber: number): ImportedShot {
+function normalizeShot(
+  record: LooseRecord,
+  fallbackNumber: number,
+  defaults: { model: string; duration: number; aspectRatio: string }
+): ImportedShot {
   const shotNumber = positiveInteger(pick(record, fieldAliases.shotNumber)) || fallbackNumber;
   const shotName = stringValue(pick(record, fieldAliases.shotName));
   const narration = stringValue(pick(record, fieldAliases.narration));
   const notes = stringValue(pick(record, fieldAliases.notes));
+  const generationCount = normalizeGenerationCount(pick(record, fieldAliases.generationCount));
   const firstFrameImage = stringValue(pick(record, fieldAliases.firstFrameImage));
   const imagePrompt = stringValue(pick(record, fieldAliases.imagePrompt));
   const explicitSource = normalizeFirstFrameSource(pick(record, fieldAliases.firstFrameSource));
@@ -228,13 +259,13 @@ function normalizeShot(record: LooseRecord, fallbackNumber: number): ImportedSho
   const modelExplicit = Boolean(requestedModel);
   const model = VIDEO_MODEL_OPTIONS.some((item) => item.value === requestedModel)
     ? requestedModel
-    : DEFAULT_VIDEO_MODEL.value;
+    : defaults.model;
   const rawDuration = pick(record, fieldAliases.duration);
   const rawAspectRatio = pick(record, fieldAliases.aspectRatio);
-  const duration = normalizeDuration(rawDuration);
-  const aspectRatio = normalizeAspectRatio(rawAspectRatio);
+  const duration = stringValue(rawDuration) === "" ? defaults.duration : normalizeDuration(rawDuration);
+  const aspectRatio = stringValue(rawAspectRatio) === "" ? defaults.aspectRatio : normalizeAspectRatio(rawAspectRatio);
   return {
-    shotNumber, shotName, narration, notes, firstFrameSource, firstFrameImage, imagePrompt, videoPrompt,
+    shotNumber, shotName, narration, notes, generationCount, firstFrameSource, firstFrameImage, imagePrompt, videoPrompt,
     model, modelExplicit, duration, durationExplicit: stringValue(rawDuration) !== "",
     aspectRatio, aspectRatioExplicit: stringValue(rawAspectRatio) !== ""
   };
@@ -253,6 +284,7 @@ function aliasKey(label: string): keyof typeof fieldAliases {
   if (["镜头名", "分镜名", "shotname"].includes(normalized)) return "shotName";
   if (["口播", "旁白", "narration", "voiceover"].includes(normalized)) return "narration";
   if (["备注", "note", "notes"].includes(normalized)) return "notes";
+  if (["生成次数", "候选数", "generationcount"].includes(normalized)) return "generationCount";
   if (["首帧来源", "firstframesource"].includes(normalized)) return "firstFrameSource";
   if (["首帧图", "首帧图片", "firstframeimage"].includes(normalized)) return "firstFrameImage";
   if (["分镜图提示词", "图片提示词", "生图提示词", "imageprompt"].includes(normalized)) return "imagePrompt";
@@ -264,9 +296,46 @@ function aliasKey(label: string): keyof typeof fieldAliases {
 
 function projectAliasKey(label: string): keyof typeof projectFieldAliases {
   const normalized = label.replace(/\s+/g, "").toLowerCase();
+  if (["格式版本", "formatversion"].includes(normalized)) return "formatVersion";
   if (["全局分镜图提示词", "全局生图提示词", "imageglobalprompt"].includes(normalized)) return "imageGlobalPrompt";
   if (["全局视频提示词", "videoglobalprompt"].includes(normalized)) return "videoGlobalPrompt";
+  if (["默认模型", "defaultmodel"].includes(normalized)) return "defaultModel";
+  if (["默认时长", "defaultduration"].includes(normalized)) return "defaultDuration";
+  if (["默认画幅", "默认比例", "defaultaspectratio"].includes(normalized)) return "defaultAspectRatio";
+  if (["角色参考图", "characterreferenceimage", "characterreferenceimages"].includes(normalized)) return "characterReferenceImages";
   return "globalPrompt";
+}
+
+function normalizeFormatVersion(value: unknown) {
+  const raw = stringValue(value);
+  if (!raw) return 1;
+  const version = Number(raw.replace(/^v/i, ""));
+  if (version !== 1) throw new Error(`不支持格式版本 ${raw}；当前仅支持格式版本 1`);
+  return 1;
+}
+
+function normalizeProjectDefaults(record: LooseRecord) {
+  const requestedModel = stringValue(pick(record, projectFieldAliases.defaultModel));
+  const model = VIDEO_MODEL_OPTIONS.some((item) => item.value === requestedModel)
+    ? requestedModel
+    : DEFAULT_VIDEO_MODEL.value;
+  const durationValue = pick(record, projectFieldAliases.defaultDuration);
+  const aspectValue = pick(record, projectFieldAliases.defaultAspectRatio);
+  return {
+    model,
+    duration: stringValue(durationValue) === "" ? 10 : normalizeDuration(durationValue),
+    aspectRatio: stringValue(aspectValue) === "" ? "9:16" : normalizeAspectRatio(aspectValue)
+  };
+}
+
+function normalizeGenerationCount(value: unknown) {
+  const number = Math.round(Number(stringValue(value)));
+  return Number.isFinite(number) && number > 0 ? Math.min(20, number) : 1;
+}
+
+function referenceList(value: unknown) {
+  const values = Array.isArray(value) ? value : stringValue(value).split(/[,，]/);
+  return [...new Set(values.map((item) => stringValue(item)).filter(Boolean))];
 }
 
 function normalizeFirstFrameSource(value: unknown): FirstFrameSource | null {

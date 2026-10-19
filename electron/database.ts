@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type {
   Account,
@@ -10,6 +11,9 @@ import type {
   AssignmentSummary,
   FirstFrameSource,
   ImageTaskStatus,
+  MediaCandidate,
+  MediaCandidateKind,
+  PreparationState,
   ProjectStyleInput,
   ProjectStyleProfile,
   TaskInput,
@@ -52,6 +56,7 @@ export class StudioDatabase {
         shot_name TEXT NOT NULL DEFAULT '',
         narration TEXT NOT NULL DEFAULT '',
         notes TEXT NOT NULL DEFAULT '',
+        generation_count INTEGER NOT NULL DEFAULT 1,
         first_frame_source TEXT NOT NULL DEFAULT 'none',
         first_frame_file_name TEXT,
         image_prompt TEXT NOT NULL DEFAULT '',
@@ -70,6 +75,12 @@ export class StudioDatabase {
         result_url TEXT,
         result_path TEXT,
         error_message TEXT,
+        image_prepare_state TEXT NOT NULL DEFAULT 'idle',
+        image_prepare_step TEXT NOT NULL DEFAULT '',
+        image_prepare_message TEXT,
+        video_prepare_state TEXT NOT NULL DEFAULT 'idle',
+        video_prepare_step TEXT NOT NULL DEFAULT '',
+        video_prepare_message TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -84,6 +95,18 @@ export class StudioDatabase {
         video_count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(account_id, usage_date)
       );
+      CREATE TABLE IF NOT EXISTS media_candidates (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        generation_index INTEGER NOT NULL,
+        candidate_index INTEGER NOT NULL,
+        source_url TEXT NOT NULL DEFAULT '',
+        file_path TEXT NOT NULL,
+        review_status TEXT NOT NULL DEFAULT 'pending',
+        has_watermark INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS project_styles (
         project_name TEXT PRIMARY KEY,
         global_prompt TEXT NOT NULL DEFAULT '',
@@ -96,13 +119,20 @@ export class StudioDatabase {
         continuity_prompt TEXT NOT NULL DEFAULT '',
         negative_prompt TEXT NOT NULL DEFAULT '',
         character_reference_path TEXT,
+        character_reference_paths_json TEXT NOT NULL DEFAULT '[]',
+        character_reference_hashes_json TEXT NOT NULL DEFAULT '[]',
+        character_reference_names_json TEXT NOT NULL DEFAULT '[]',
         scene_reference_path TEXT,
+        scene_reference_name TEXT,
         style_reference_path TEXT,
+        style_reference_name TEXT,
+        output_directory TEXT,
         locked_model TEXT,
         locked_aspect_ratio TEXT,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_media_candidates_task ON media_candidates(task_id, kind, generation_index, candidate_index);
     `);
     const taskColumns = new Set(
       (this.db.prepare("PRAGMA table_info(tasks)").all() as DbRow[]).map((row) => String(row.name))
@@ -116,6 +146,7 @@ export class StudioDatabase {
     if (!taskColumns.has("shot_name")) this.db.exec("ALTER TABLE tasks ADD COLUMN shot_name TEXT NOT NULL DEFAULT ''");
     if (!taskColumns.has("narration")) this.db.exec("ALTER TABLE tasks ADD COLUMN narration TEXT NOT NULL DEFAULT ''");
     if (!taskColumns.has("notes")) this.db.exec("ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("generation_count")) this.db.exec("ALTER TABLE tasks ADD COLUMN generation_count INTEGER NOT NULL DEFAULT 1");
     if (!taskColumns.has("model_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN model_source TEXT NOT NULL DEFAULT 'shot'");
     if (!taskColumns.has("duration_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN duration_source TEXT NOT NULL DEFAULT 'shot'");
     if (!taskColumns.has("aspect_ratio_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN aspect_ratio_source TEXT NOT NULL DEFAULT 'shot'");
@@ -137,6 +168,12 @@ export class StudioDatabase {
     if (!taskColumns.has("image_path")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN image_path TEXT");
     }
+    if (!taskColumns.has("image_prepare_state")) this.db.exec("ALTER TABLE tasks ADD COLUMN image_prepare_state TEXT NOT NULL DEFAULT 'idle'");
+    if (!taskColumns.has("image_prepare_step")) this.db.exec("ALTER TABLE tasks ADD COLUMN image_prepare_step TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("image_prepare_message")) this.db.exec("ALTER TABLE tasks ADD COLUMN image_prepare_message TEXT");
+    if (!taskColumns.has("video_prepare_state")) this.db.exec("ALTER TABLE tasks ADD COLUMN video_prepare_state TEXT NOT NULL DEFAULT 'idle'");
+    if (!taskColumns.has("video_prepare_step")) this.db.exec("ALTER TABLE tasks ADD COLUMN video_prepare_step TEXT NOT NULL DEFAULT ''");
+    if (!taskColumns.has("video_prepare_message")) this.db.exec("ALTER TABLE tasks ADD COLUMN video_prepare_message TEXT");
     this.db.exec(`
       UPDATE tasks
       SET first_frame_source = CASE
@@ -162,9 +199,28 @@ export class StudioDatabase {
     if (!projectStyleColumns.has("legacy_migration_pending")) {
       this.db.exec("ALTER TABLE project_styles ADD COLUMN legacy_migration_pending INTEGER NOT NULL DEFAULT 0");
     }
+    if (!projectStyleColumns.has("character_reference_paths_json")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN character_reference_paths_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!projectStyleColumns.has("character_reference_hashes_json")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN character_reference_hashes_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!projectStyleColumns.has("character_reference_names_json")) {
+      this.db.exec("ALTER TABLE project_styles ADD COLUMN character_reference_names_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!projectStyleColumns.has("scene_reference_name")) this.db.exec("ALTER TABLE project_styles ADD COLUMN scene_reference_name TEXT");
+    if (!projectStyleColumns.has("style_reference_name")) this.db.exec("ALTER TABLE project_styles ADD COLUMN style_reference_name TEXT");
+    if (!projectStyleColumns.has("output_directory")) this.db.exec("ALTER TABLE project_styles ADD COLUMN output_directory TEXT");
+    this.db.exec(`
+      UPDATE project_styles
+      SET character_reference_paths_json = json_array(character_reference_path)
+      WHERE character_reference_path IS NOT NULL AND character_reference_path != ''
+        AND character_reference_paths_json = '[]'
+    `);
     this.createLegacyStyleDrafts();
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("maxActiveWorkers", "2");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("automationEnabled", "false");
+    this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("autoClickGenerate", "false");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("lastTaskAccountId", "");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("lastVideoModel", "Seedance 2.0 mini");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("lastVideoDuration", "10");
@@ -224,13 +280,147 @@ export class StudioDatabase {
   }
 
   listTasks(): TaskRecord[] {
-    return (this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all() as DbRow[]).map(rowToTask);
+    return (this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all() as DbRow[]).map((row) => this.enrichTask(rowToTask(row)));
   }
 
   getTask(id: string): TaskRecord {
     const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as DbRow | undefined;
     if (!row) throw new Error("任务不存在");
-    return rowToTask(row);
+    return this.enrichTask(rowToTask(row));
+  }
+
+  private enrichTask(task: TaskRecord): TaskRecord {
+    const candidates = this.listTaskCandidates(task.id);
+    return {
+      ...task,
+      imageCandidates: candidates.filter((item) => item.kind === "image"),
+      videoCandidates: candidates.filter((item) => item.kind === "video")
+    };
+  }
+
+  listTaskCandidates(taskId: string): MediaCandidate[] {
+    return (this.db.prepare(`
+      SELECT * FROM media_candidates WHERE task_id = ?
+      ORDER BY generation_index DESC, candidate_index ASC
+    `).all(taskId) as DbRow[]).map(rowToMediaCandidate);
+  }
+
+  nextGenerationIndex(taskId: string, kind: MediaCandidateKind) {
+    this.getTask(taskId);
+    const row = this.db.prepare("SELECT MAX(generation_index) AS max_index FROM media_candidates WHERE task_id = ? AND kind = ?")
+      .get(taskId, kind) as DbRow;
+    return Math.max(1, Number(row.max_index || 0) + 1);
+  }
+
+  generationTarget(taskId: string, kind: MediaCandidateKind, accountLabel: string) {
+    const task = this.getTask(taskId);
+    const generationIndex = this.nextGenerationIndex(taskId, kind);
+    const project = safeFilePart(task.projectName || "未命名项目");
+    const shot = String(task.shotNumber).padStart(2, "0");
+    const projectRoot = this.getProjectStyle(task.projectName)?.outputDirectory
+      || path.join(this.dataDir, "projects", project);
+    const folder = path.join(projectRoot, kind === "image" ? "分镜图" : "视频");
+    mkdirSync(folder, { recursive: true });
+    const baseName = kind === "image"
+      ? `${project}_分镜${shot}`
+      : `${project}_分镜${shot}_${safeFilePart(accountLabel).replace(/\s+/g, "")}_第${generationIndex}次`;
+    return { folder, baseName, generationIndex };
+  }
+
+  addTaskCandidates(
+    taskId: string,
+    kind: MediaCandidateKind,
+    generationIndex: number,
+    items: Array<{ sourceUrl: string; filePath: string; hasWatermark?: boolean }>
+  ) {
+    this.getTask(taskId);
+    const insert = this.db.prepare(`
+      INSERT INTO media_candidates(id, task_id, kind, generation_index, candidate_index, source_url, file_path, review_status, has_watermark, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `);
+    items.forEach((item, index) => insert.run(
+      randomUUID(), taskId, kind, generationIndex, index + 1, item.sourceUrl, item.filePath, item.hasWatermark ? 1 : 0, now()
+    ));
+    this.db.prepare("UPDATE tasks SET generation_count = MAX(generation_count, ?), updated_at = ? WHERE id = ?")
+      .run(generationIndex, now(), taskId);
+    return this.getTask(taskId);
+  }
+
+  approveImageCandidate(candidateId: string) {
+    const candidate = this.getCandidate(candidateId);
+    if (candidate.kind !== "image") throw new Error("请选择分镜图候选");
+    const task = this.getTask(candidate.taskId);
+    const managedPath = this.storeManagedImage(candidate.filePath);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("UPDATE media_candidates SET review_status = CASE WHEN id = ? THEN 'approved' ELSE CASE WHEN kind = 'image' THEN 'rejected' ELSE review_status END END WHERE task_id = ?")
+        .run(candidateId, task.id);
+      this.db.prepare(`
+        UPDATE tasks SET image_path = ?, first_frame_file_name = ?, image_status = 'approved',
+          image_prepare_state = 'ready', image_prepare_step = '首帧已锁定', image_prepare_message = NULL,
+          video_prepare_state = 'idle', video_prepare_step = '', video_prepare_message = NULL, updated_at = ? WHERE id = ?
+      `).run(managedPath, path.basename(candidate.filePath), now(), task.id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTask(task.id);
+  }
+
+  reviewVideoCandidate(candidateId: string, approved: boolean) {
+    const candidate = this.getCandidate(candidateId);
+    if (candidate.kind !== "video") throw new Error("请选择视频候选");
+    let filePath = candidate.filePath;
+    if (!approved) {
+      const rejectedDir = path.join(path.dirname(candidate.filePath), "作废");
+      mkdirSync(rejectedDir, { recursive: true });
+      const target = uniqueTargetPath(path.join(rejectedDir, path.basename(candidate.filePath)));
+      if (existsSync(candidate.filePath)) renameSync(candidate.filePath, target);
+      filePath = target;
+    }
+    this.db.prepare("UPDATE media_candidates SET review_status = ?, file_path = ? WHERE id = ?")
+      .run(approved ? "approved" : "rejected", filePath, candidateId);
+    const approvedCandidate = this.db.prepare(`
+      SELECT file_path FROM media_candidates
+      WHERE task_id = ? AND kind = 'video' AND review_status = 'approved'
+      ORDER BY generation_index DESC LIMIT 1
+    `).get(candidate.taskId) as DbRow | undefined;
+    const hasApproved = Boolean(approvedCandidate);
+    const status = hasApproved ? "succeeded" : "queued";
+    const resultPath = approvedCandidate?.file_path ? String(approvedCandidate.file_path) : null;
+    const step = approved ? "已通过" : hasApproved ? "已通过（本次候选已作废）" : "已作废";
+    this.db.prepare(`
+      UPDATE tasks SET status = ?, result_path = ?, error_message = NULL,
+        video_prepare_state = 'ready', video_prepare_step = ?, video_prepare_message = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(status, resultPath, step, now(), candidate.taskId);
+    return this.getTask(candidate.taskId);
+  }
+
+  candidateFilePath(candidateId: string) {
+    return this.getCandidate(candidateId).filePath;
+  }
+
+  importVideoCandidate(taskId: string, sourcePath: string, accountLabel: string) {
+    if (!existsSync(sourcePath)) throw new Error("选择的视频文件不存在");
+    if (path.extname(sourcePath).toLowerCase() !== ".mp4") throw new Error("目前只支持导入 MP4 视频");
+    const target = this.generationTarget(taskId, "video", accountLabel);
+    const filePath = uniqueTargetPath(path.join(target.folder, `${target.baseName}.mp4`));
+    if (path.normalize(path.resolve(sourcePath)) !== path.normalize(path.resolve(filePath))) copyFileSync(sourcePath, filePath);
+    this.addTaskCandidates(taskId, "video", target.generationIndex, [{ sourceUrl: "manual-import", filePath, hasWatermark: false }]);
+    this.db.prepare(`
+      UPDATE tasks SET status = 'review', error_message = NULL,
+        video_prepare_state = 'ready', video_prepare_step = '已导入视频候选', video_prepare_message = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(now(), taskId);
+    return this.getTask(taskId);
+  }
+
+  private getCandidate(id: string): MediaCandidate {
+    const row = this.db.prepare("SELECT * FROM media_candidates WHERE id = ?").get(id) as DbRow | undefined;
+    if (!row) throw new Error("候选素材不存在");
+    return rowToMediaCandidate(row);
   }
 
   createTask(input: TaskInput): TaskRecord {
@@ -241,11 +431,11 @@ export class StudioDatabase {
     const imageStatus = initialImageStatus(normalized.firstFrameSource, imagePath);
     this.db.prepare(`
       INSERT INTO tasks(
-        id, project_name, shot_number, shot_name, narration, notes, first_frame_source, first_frame_file_name,
+        id, project_name, shot_number, shot_name, narration, notes, generation_count, first_frame_source, first_frame_file_name,
         image_prompt, image_account_id, image_status, image_path,
         account_id, prompt, model, model_source, duration, duration_source, aspect_ratio, aspect_ratio_source, status, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
     `).run(
       id,
       normalized.projectName,
@@ -253,6 +443,7 @@ export class StudioDatabase {
       normalized.shotName ?? "",
       normalized.narration ?? "",
       normalized.notes ?? "",
+      normalized.generationCount ?? 1,
       normalized.firstFrameSource,
       normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
@@ -306,9 +497,11 @@ export class StudioDatabase {
           : previous.imageStatus;
     this.db.prepare(`
       UPDATE tasks
-      SET project_name = ?, shot_number = ?, shot_name = ?, narration = ?, notes = ?, first_frame_source = ?, first_frame_file_name = ?,
+      SET project_name = ?, shot_number = ?, shot_name = ?, narration = ?, notes = ?, generation_count = ?, first_frame_source = ?, first_frame_file_name = ?,
           image_prompt = ?, image_account_id = ?, image_status = ?, image_path = ?,
-          account_id = ?, prompt = ?, model = ?, model_source = ?, duration = ?, duration_source = ?, aspect_ratio = ?, aspect_ratio_source = ?, updated_at = ?
+          account_id = ?, prompt = ?, model = ?, model_source = ?, duration = ?, duration_source = ?, aspect_ratio = ?, aspect_ratio_source = ?,
+          image_prepare_state = 'idle', image_prepare_step = '', image_prepare_message = NULL,
+          video_prepare_state = 'idle', video_prepare_step = '', video_prepare_message = NULL, updated_at = ?
       WHERE id = ?
     `).run(
       normalized.projectName,
@@ -316,6 +509,7 @@ export class StudioDatabase {
       normalized.shotName ?? "",
       normalized.narration ?? "",
       normalized.notes ?? "",
+      normalized.generationCount ?? 1,
       normalized.firstFrameSource,
       normalized.firstFrameFileName ?? null,
       normalized.imagePrompt,
@@ -344,6 +538,7 @@ export class StudioDatabase {
       shotName: source.shotName,
       narration: source.narration,
       notes: source.notes,
+      generationCount: source.generationCount,
       firstFrameSource: source.firstFrameSource,
       firstFrameFileName: source.firstFrameFileName,
       sourceImagePath: source.imagePath,
@@ -375,6 +570,23 @@ export class StudioDatabase {
     return this.getTask(id);
   }
 
+  setTaskPreparation(
+    id: string,
+    stage: "image" | "video",
+    state: PreparationState,
+    step: string,
+    message: string | null = null
+  ): TaskRecord {
+    this.getTask(id);
+    const prefix = stage === "image" ? "image" : "video";
+    this.db.prepare(`
+      UPDATE tasks
+      SET ${prefix}_prepare_state = ?, ${prefix}_prepare_step = ?, ${prefix}_prepare_message = ?, updated_at = ?
+      WHERE id = ?
+    `).run(state, step.trim(), message, now(), id);
+    return this.getTask(id);
+  }
+
   setTaskImageStatus(id: string, status: ImageTaskStatus): TaskRecord {
     const previous = this.getTask(id);
     if (previous.firstFrameSource === "none" && status !== "skipped") throw new Error("这个分镜没有首帧");
@@ -398,7 +610,8 @@ export class StudioDatabase {
     this.db.prepare(`
       UPDATE tasks
       SET first_frame_source = ?, first_frame_file_name = ?, image_path = ?, image_status = 'approved',
-          aspect_ratio = ?, aspect_ratio_source = ?, updated_at = ?
+          aspect_ratio = ?, aspect_ratio_source = ?,
+          video_prepare_state = 'idle', video_prepare_step = '', video_prepare_message = NULL, updated_at = ?
       WHERE id = ?
     `).run(
       source, path.basename(imagePath), managedPath,
@@ -484,14 +697,21 @@ export class StudioDatabase {
   saveProjectStyle(input: ProjectStyleInput): ProjectStyleProfile {
     const projectName = input.projectName.trim();
     if (!projectName) throw new Error("请先填写项目名称，再设置风格锁定");
+    const characterReferences = dedupeReferences(input.characterReferencePaths.map((sourcePath, index) => ({
+      ...this.storeManagedProjectReference(sourcePath),
+      name: input.characterReferenceNames?.[index] || path.basename(sourcePath)
+    })));
+    const outputDirectory = input.outputDirectory ? path.resolve(input.outputDirectory) : null;
+    if (outputDirectory) mkdirSync(outputDirectory, { recursive: true });
     const updatedAt = now();
     this.db.prepare(`
       INSERT INTO project_styles(
         project_name, global_prompt, image_global_prompt, video_global_prompt, legacy_migration_pending,
         style_prompt, character_prompt, scene_prompt, continuity_prompt, negative_prompt,
-        character_reference_path, scene_reference_path, style_reference_path,
+        character_reference_path, character_reference_paths_json, character_reference_hashes_json, character_reference_names_json,
+        scene_reference_path, scene_reference_name, style_reference_path, style_reference_name, output_directory,
         locked_model, locked_aspect_ratio, updated_at
-      ) VALUES (?, ?, ?, ?, 0, '', '', '', '', '', ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, 0, '', '', '', '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project_name) DO UPDATE SET
         global_prompt = excluded.global_prompt,
         image_global_prompt = excluded.image_global_prompt,
@@ -503,8 +723,14 @@ export class StudioDatabase {
         continuity_prompt = '',
         negative_prompt = '',
         character_reference_path = excluded.character_reference_path,
+        character_reference_paths_json = excluded.character_reference_paths_json,
+        character_reference_hashes_json = excluded.character_reference_hashes_json,
+        character_reference_names_json = excluded.character_reference_names_json,
         scene_reference_path = excluded.scene_reference_path,
+        scene_reference_name = excluded.scene_reference_name,
         style_reference_path = excluded.style_reference_path,
+        style_reference_name = excluded.style_reference_name,
+        output_directory = excluded.output_directory,
         locked_model = excluded.locked_model,
         locked_aspect_ratio = excluded.locked_aspect_ratio,
         updated_at = excluded.updated_at
@@ -513,9 +739,15 @@ export class StudioDatabase {
       input.globalPrompt.trim(),
       input.imageGlobalPrompt.trim(),
       input.videoGlobalPrompt.trim(),
-      input.characterReferencePath || null,
+      characterReferences[0]?.path || null,
+      JSON.stringify(characterReferences.map((item) => item.path)),
+      JSON.stringify(characterReferences.map((item) => item.hash)),
+      JSON.stringify(characterReferences.map((item) => item.name)),
       input.sceneReferencePath || null,
+      input.sceneReferenceName || (input.sceneReferencePath ? path.basename(input.sceneReferencePath) : null),
       input.styleReferencePath || null,
+      input.styleReferenceName || (input.styleReferencePath ? path.basename(input.styleReferencePath) : null),
+      outputDirectory,
       input.lockedModel || null,
       input.lockedAspectRatio || null,
       updatedAt
@@ -565,6 +797,7 @@ export class StudioDatabase {
     return {
       maxActiveWorkers: clampWorkers(Number(values.maxActiveWorkers || 2)),
       automationEnabled: values.automationEnabled === "true",
+      autoClickGenerate: values.autoClickGenerate === "true",
       lastTaskAccountId: values.lastTaskAccountId || null,
       lastVideoModel: values.lastVideoModel || "Seedance 2.0 mini",
       lastVideoDuration: Number(values.lastVideoDuration || 10),
@@ -580,6 +813,10 @@ export class StudioDatabase {
     if (input.automationEnabled !== undefined) {
       this.db.prepare("INSERT OR REPLACE INTO settings(key, value) VALUES ('automationEnabled', ?)")
         .run(String(Boolean(input.automationEnabled)));
+    }
+    if (input.autoClickGenerate !== undefined) {
+      this.db.prepare("INSERT OR REPLACE INTO settings(key, value) VALUES ('autoClickGenerate', ?)")
+        .run(String(Boolean(input.autoClickGenerate)));
     }
     if (input.lastTaskAccountId !== undefined) {
       this.db.prepare("INSERT OR REPLACE INTO settings(key, value) VALUES ('lastTaskAccountId', ?)")
@@ -621,6 +858,7 @@ export class StudioDatabase {
       shotName: input.shotName?.trim() || "",
       narration: input.narration?.trim() || "",
       notes: input.notes?.trim() || "",
+      generationCount: Math.min(20, Math.max(1, Math.round(Number(input.generationCount) || 1))),
       modelSource: input.modelSource ?? "shot",
       durationSource: input.durationSource ?? "shot",
       aspectRatioSource: input.aspectRatioSource ?? "shot",
@@ -677,6 +915,29 @@ export class StudioDatabase {
     if (!existsSync(target)) copyFileSync(resolved, target);
     return target;
   }
+
+  private storeManagedProjectReference(sourcePath: string) {
+    const resolved = path.resolve(sourcePath);
+    if (!existsSync(resolved)) throw new Error(`角色参考图不存在：${sourcePath}`);
+    const bytes = readFileSync(resolved);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const extension = path.extname(resolved).toLowerCase();
+    if (![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) throw new Error("角色参考图格式不支持");
+    const targetDir = path.join(this.dataDir, "assets", "project-references");
+    mkdirSync(targetDir, { recursive: true });
+    const target = path.join(targetDir, `${hash}${extension === ".jpeg" ? ".jpg" : extension}`);
+    if (!existsSync(target) && path.normalize(resolved) !== path.normalize(target)) copyFileSync(resolved, target);
+    return { path: target, hash };
+  }
+}
+
+function dedupeReferences(references: Array<{ path: string; hash: string; name: string }>) {
+  const seen = new Set<string>();
+  return references.filter((item) => {
+    if (seen.has(item.hash)) return false;
+    seen.add(item.hash);
+    return true;
+  });
 }
 
 function leastLoaded(accountIds: string[], loads: Map<string, number>) {
@@ -738,6 +999,7 @@ function rowToTask(row: DbRow): TaskRecord {
     shotName: String(row.shot_name || ""),
     narration: String(row.narration || ""),
     notes: String(row.notes || ""),
+    generationCount: Math.min(20, Math.max(1, Number(row.generation_count) || 1)),
     firstFrameSource: String(row.first_frame_source || (row.image_prompt ? "generated" : row.image_path ? "local" : "none")) as FirstFrameSource,
     firstFrameFileName: row.first_frame_file_name ? String(row.first_frame_file_name) : null,
     imagePrompt: row.image_prompt ? String(row.image_prompt) : "",
@@ -756,9 +1018,48 @@ function rowToTask(row: DbRow): TaskRecord {
     resultUrl: row.result_url ? String(row.result_url) : null,
     resultPath: row.result_path ? String(row.result_path) : null,
     errorMessage: row.error_message ? String(row.error_message) : null,
+    imagePrepareState: String(row.image_prepare_state || "idle") as PreparationState,
+    imagePrepareStep: String(row.image_prepare_step || ""),
+    imagePrepareMessage: row.image_prepare_message ? String(row.image_prepare_message) : null,
+    videoPrepareState: String(row.video_prepare_state || "idle") as PreparationState,
+    videoPrepareStep: String(row.video_prepare_step || ""),
+    videoPrepareMessage: row.video_prepare_message ? String(row.video_prepare_message) : null,
+    imageCandidates: [],
+    videoCandidates: [],
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at)
   };
+}
+
+function rowToMediaCandidate(row: DbRow): MediaCandidate {
+  const filePath = String(row.file_path);
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    kind: String(row.kind) as MediaCandidateKind,
+    generationIndex: Math.max(1, Number(row.generation_index) || 1),
+    candidateIndex: Math.max(1, Number(row.candidate_index) || 1),
+    sourceUrl: String(row.source_url || ""),
+    filePath,
+    previewUrl: pathToFileURL(filePath).href,
+    reviewStatus: String(row.review_status || "pending") as MediaCandidate["reviewStatus"],
+    hasWatermark: Boolean(Number(row.has_watermark || 0)),
+    createdAt: String(row.created_at)
+  };
+}
+
+function safeFilePart(value: string) {
+  const normalized = value.trim().replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "");
+  return (normalized || "未命名").slice(0, 80);
+}
+
+function uniqueTargetPath(target: string) {
+  if (!existsSync(target)) return target;
+  const extension = path.extname(target);
+  const stem = target.slice(0, -extension.length);
+  let index = 2;
+  while (existsSync(`${stem}_${index}${extension}`)) index += 1;
+  return `${stem}_${index}${extension}`;
 }
 
 function rowToUsage(row: DbRow): AccountUsage {
@@ -771,17 +1072,36 @@ function rowToUsage(row: DbRow): AccountUsage {
 }
 
 function rowToProjectStyle(row: DbRow): ProjectStyleProfile {
+  const legacyPath = row.character_reference_path ? String(row.character_reference_path) : null;
+  const paths = parseStringArray(row.character_reference_paths_json);
+  const hashes = parseStringArray(row.character_reference_hashes_json);
+  const names = parseStringArray(row.character_reference_names_json);
   return {
     projectName: String(row.project_name),
     globalPrompt: String(row.global_prompt || ""),
     imageGlobalPrompt: String(row.image_global_prompt || ""),
     videoGlobalPrompt: String(row.video_global_prompt || ""),
     migrationPending: Boolean(Number(row.legacy_migration_pending || 0)),
-    characterReferencePath: row.character_reference_path ? String(row.character_reference_path) : null,
+    characterReferencePaths: paths.length ? paths : legacyPath ? [legacyPath] : [],
+    characterReferenceHashes: hashes,
+    characterReferenceNames: names.length ? names : (paths.length ? paths.map(() => "") : []),
     sceneReferencePath: row.scene_reference_path ? String(row.scene_reference_path) : null,
+    sceneReferenceName: row.scene_reference_name ? String(row.scene_reference_name) : null,
     styleReferencePath: row.style_reference_path ? String(row.style_reference_path) : null,
+    styleReferenceName: row.style_reference_name ? String(row.style_reference_name) : null,
+    outputDirectory: row.output_directory ? String(row.output_directory) : null,
     lockedModel: row.locked_model ? String(row.locked_model) : null,
     lockedAspectRatio: row.locked_aspect_ratio ? String(row.locked_aspect_ratio) : null,
     updatedAt: String(row.updated_at)
   };
+}
+
+function parseStringArray(value: string | number | null | undefined) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string" && Boolean(item)) : [];
+  } catch {
+    return [];
+  }
 }

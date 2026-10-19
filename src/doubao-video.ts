@@ -28,10 +28,25 @@ export function parseDoubaoImageAspectText(value: string) {
 
 export function isDoubaoVideoModeActive(snapshot: DoubaoVideoModeSnapshot) {
   const labels = snapshot.modeLabels.map((value) => value.replace(/\s+/g, "").trim());
-  const hasModeLabel = labels.some((value) => /^视频生成(?:[×✕✖xX])?$/.test(value));
+  const hasModeLabel = labels.some((value) => /^视频生成(?:[×✕✖xX])?$/.test(value) || value === "视频");
   const hasModel = snapshot.controlTexts.some((value) => /Seedance/i.test(value));
   const hasParameters = snapshot.controlTexts.some((value) => parseDoubaoVideoParameterText(value) !== null);
   return hasModeLabel && hasModel && hasParameters;
+}
+
+export function videoSourceHasWatermark(sourceUrl: string) {
+  let normalized = sourceUrl.toLowerCase();
+  try {
+    normalized = decodeURIComponent(normalized);
+    const parsed = new URL(sourceUrl);
+    const rendition = parsed.searchParams.get("lr")?.toLowerCase() || "";
+    if (rendition === "unwatermarked") return false;
+    if (rendition.includes("watermark")) return true;
+  } catch {
+    // Fall back to URL text matching for malformed or partially escaped URLs.
+  }
+  if (normalized.includes("unwatermarked")) return false;
+  return /video_gen_watermark|video_dsz_watermark|watermark_dyn|(?:^|[\/_?&=.-])watermarked(?:$|[\/_?&=.-])/.test(normalized);
 }
 
 export function normalizedModelName(value: string) {

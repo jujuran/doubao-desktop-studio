@@ -89,12 +89,14 @@ describe("StudioDatabase", () => {
       lastTaskAccountId: account.id,
       lastVideoModel: "Seedance 2.0 mini",
       lastVideoDuration: 8,
-      lastAspectRatio: "16:9"
+      lastAspectRatio: "16:9",
+      autoClickGenerate: true
     });
 
     expect(settings.lastTaskAccountId).toBe(account.id);
     expect(settings.lastVideoDuration).toBe(8);
     expect(settings.lastAspectRatio).toBe("16:9");
+    expect(settings.autoClickGenerate).toBe(true);
     db.close();
   });
 
@@ -204,7 +206,13 @@ describe("StudioDatabase", () => {
   });
 
   it("stores project style profiles and applies locked settings", () => {
-    const db = createDatabase();
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-references-"));
+    tempDirs.push(dir);
+    const firstReference = path.join(dir, "character-front.png");
+    const duplicateReference = path.join(dir, "character-copy.png");
+    writeFileSync(firstReference, "same character image");
+    writeFileSync(duplicateReference, "same character image");
+    const db = new StudioDatabase(path.join(dir, "data"));
     const task = db.createTask({
       projectName: "统一风格短片",
       shotNumber: 1,
@@ -225,7 +233,7 @@ describe("StudioDatabase", () => {
       imageGlobalPrompt: "保持宠物定妆与室内布局一致",
       videoGlobalPrompt: "光线方向连续，禁止换装",
       migrationPending: false,
-      characterReferencePath: "C:\\refs\\character.png",
+      characterReferencePaths: [firstReference, duplicateReference],
       sceneReferencePath: null,
       styleReferencePath: null,
       lockedModel: "Seedance 2.0 mini",
@@ -233,6 +241,10 @@ describe("StudioDatabase", () => {
     });
 
     expect(profile.globalPrompt).toBe("低饱和写实电影风格");
+    expect(profile.characterReferencePaths).toHaveLength(1);
+    expect(profile.characterReferenceHashes[0]).toHaveLength(64);
+    expect(profile.characterReferencePaths[0]).not.toBe(firstReference);
+    expect(existsSync(profile.characterReferencePaths[0])).toBe(true);
     expect(db.applyProjectLocks(profile.projectName)).toBe(1);
     expect(db.getTask(task.id)).toMatchObject({
       model: "Seedance 2.0 mini",
@@ -268,6 +280,129 @@ describe("StudioDatabase", () => {
     expect(task.imageStatus).toBe("approved");
     expect(task.imagePath).not.toBe(source);
     expect(existsSync(task.imagePath!)).toBe(true);
+    db.close();
+  });
+
+  it("persists image and video preparation progress on the task", () => {
+    const db = createDatabase();
+    const task = db.createTask({
+      projectName: "进度测试",
+      shotNumber: 1,
+      imagePrompt: "柯基静帧",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基转头",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+    expect(db.setTaskPreparation(task.id, "image", "running", "设置图片比例"))
+      .toMatchObject({ imagePrepareState: "running", imagePrepareStep: "设置图片比例" });
+    expect(db.setTaskPreparation(task.id, "video", "failed", "上传首帧", "没有找到上传控件"))
+      .toMatchObject({ videoPrepareState: "failed", videoPrepareStep: "上传首帧", videoPrepareMessage: "没有找到上传控件" });
+    db.close();
+  });
+
+  it("stores downloaded candidates, locks an approved image and archives a rejected video", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-candidates-"));
+    tempDirs.push(dir);
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const image = path.join(dir, "candidate.png");
+    const video = path.join(dir, "candidate.mp4");
+    writeFileSync(image, "image bytes");
+    writeFileSync(video, "video bytes");
+    const task = db.createTask({
+      projectName: "候选闭环",
+      shotNumber: 3,
+      firstFrameSource: "generated",
+      imagePrompt: "一只柯基",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基眨眼",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+    const withImage = db.addTaskCandidates(task.id, "image", 1, [{ sourceUrl: "https://example/image.png", filePath: image }]);
+    const approved = db.approveImageCandidate(withImage.imageCandidates[0].id);
+    expect(approved.imageStatus).toBe("approved");
+    expect(approved.imageCandidates[0].reviewStatus).toBe("approved");
+    expect(existsSync(approved.imagePath!)).toBe(true);
+
+    const withVideo = db.addTaskCandidates(task.id, "video", 1, [{ sourceUrl: "https://example/video.mp4", filePath: video, hasWatermark: true }]);
+    const rejected = db.reviewVideoCandidate(withVideo.videoCandidates[0].id, false);
+    expect(rejected.status).toBe("queued");
+    expect(rejected.videoCandidates[0].reviewStatus).toBe("rejected");
+    expect(rejected.videoCandidates[0].filePath).toContain("作废");
+    expect(existsSync(rejected.videoCandidates[0].filePath)).toBe(true);
+    db.close();
+  });
+
+  it("keeps a task completed when a later video candidate is rejected", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-multi-candidates-"));
+    tempDirs.push(dir);
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const firstVideo = path.join(dir, "first.mp4");
+    const secondVideo = path.join(dir, "second.mp4");
+    writeFileSync(firstVideo, "first video");
+    writeFileSync(secondVideo, "second video");
+    const task = db.createTask({
+      projectName: "多候选审核",
+      shotNumber: 1,
+      imagePrompt: "",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基回头",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+    let updated = db.addTaskCandidates(task.id, "video", 1, [{ sourceUrl: "first", filePath: firstVideo }]);
+    updated = db.reviewVideoCandidate(updated.videoCandidates[0].id, true);
+    const approvedPath = updated.resultPath;
+    updated = db.addTaskCandidates(task.id, "video", 2, [{ sourceUrl: "second", filePath: secondVideo }]);
+    const latest = updated.videoCandidates.find((candidate) => candidate.generationIndex === 2)!;
+    updated = db.reviewVideoCandidate(latest.id, false);
+    expect(updated.status).toBe("succeeded");
+    expect(updated.resultPath).toBe(approvedPath);
+    expect(updated.videoPrepareStep).toContain("已通过");
+    expect(updated.generationCount).toBe(2);
+    db.close();
+  });
+
+  it("stores a project output directory and removes spaces from account labels in filenames", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-output-"));
+    tempDirs.push(dir);
+    const outputDirectory = path.join(dir, "项目素材");
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const task = db.createTask({
+      projectName: "输出测试",
+      shotNumber: 3,
+      imagePrompt: "",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基眨眼",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+    db.saveProjectStyle({
+      projectName: "输出测试",
+      globalPrompt: "",
+      imageGlobalPrompt: "",
+      videoGlobalPrompt: "",
+      migrationPending: false,
+      characterReferencePaths: [],
+      sceneReferencePath: null,
+      styleReferencePath: null,
+      outputDirectory,
+      lockedModel: null,
+      lockedAspectRatio: null
+    });
+    const target = db.generationTarget(task.id, "video", "账号 1");
+    expect(target.folder).toBe(path.join(outputDirectory, "视频"));
+    expect(target.baseName).toContain("账号1");
+    expect(target.baseName).not.toContain("账号 1");
     db.close();
   });
 
