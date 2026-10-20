@@ -162,17 +162,19 @@ function registerIpc() {
       if (!task.imagePrompt) throw new Error("这个分镜没有生图提示词");
       if (!task.imageAccountId) throw new Error("请先为分镜图选择账号，或使用自动分配");
       const account = database.getAccount(task.imageAccountId);
-      const finalPrompt = composeDeliveryPrompt("image", task.imagePrompt, database.getProjectStyle(task.projectName));
-      clipboard.writeText(finalPrompt);
+      const projectStyle = database.getProjectStyle(task.projectName);
+      const basePrompt = composeDeliveryPrompt("image", task.imagePrompt, projectStyle);
       database.setTaskImageStatus(id, "preparing");
       database.setTaskPreparation(id, "image", "running", "打开生图页");
       notifyChanged();
-      await sessions.prepare(account, "image", finalPrompt, null, undefined, task.aspectRatio, (progress) => {
+      const prepared = await sessions.prepare(account, "image", basePrompt, null, undefined, task.aspectRatio, (progress) => {
         database.setTaskPreparation(id, "image", progress.state, progress.step);
         notifyChanged();
-      });
-      const updated = database.setTaskPreparation(id, "image", "ready", "已就绪（请到豆包点生成）");
-      startGenerationMonitor(id, "image", account.id, finalPrompt);
+      }, projectStyle?.characterReferencePaths ?? []);
+      clipboard.writeText(prepared.prompt);
+      const autoClick = database.getSettings().autoClickGenerate;
+      const updated = database.setTaskPreparation(id, "image", "ready", autoClick ? "自动点击生成" : "等待你在豆包点击生成");
+      startGenerationMonitor(id, "image", account.id, prepared.prompt);
       notifyChanged();
       return updated;
     } catch (error) {
@@ -460,7 +462,8 @@ async function prepareVideoTask(id: string) {
       }
     );
     database.setTaskStatus(id, task.status === "failed" ? "queued" : task.status, null);
-    const updated = database.setTaskPreparation(id, "video", "ready", "已就绪（请到豆包点生成）");
+    const autoClick = database.getSettings().autoClickGenerate;
+    const updated = database.setTaskPreparation(id, "video", "ready", autoClick ? "自动点击生成" : "等待你在豆包点击生成");
     startGenerationMonitor(id, "video", account.id, finalPrompt);
     diagnostics.info("video_task_prepare_completed", { taskId: shortTaskId(id), accountId: shortAccountId(account.id) });
     notifyChanged();

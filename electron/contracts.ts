@@ -42,6 +42,8 @@ export interface TaskRecord {
   narration: string;
   notes: string;
   generationCount: number;
+  imageGenerationCount: number;
+  videoGenerationCount: number;
   firstFrameSource: FirstFrameSource;
   firstFrameFileName: string | null;
   imagePrompt: string;

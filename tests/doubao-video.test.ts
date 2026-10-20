@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareDoubaoVideoSettings, concreteDuration, doubaoAspectRatio, durationToSliderValue, isDoubaoVideoModeActive, normalizeComposerText, normalizedModelName, parseDoubaoImageAspectText, parseDoubaoVideoParameterText, videoSourceHasWatermark } from "../src/doubao-video";
+import { compareDoubaoVideoSettings, concreteDuration, doubaoAspectRatio, durationToSliderValue, isDoubaoVideoModeActive, normalizeComposerText, normalizedModelName, parseDoubaoImageAspectText, parseDoubaoVideoParameterText, parseExpectedVideoWaitMinutes, videoSourceHasWatermark } from "../src/doubao-video";
 
 describe("Doubao video setting verification", () => {
   it("normalizes labels shown by Doubao", () => {
@@ -73,5 +73,11 @@ describe("Doubao video setting verification", () => {
     expect(videoSourceHasWatermark("https://example.com/video_gen_watermark_dyn/video.mp4")).toBe(true);
     expect(videoSourceHasWatermark("https://example.com/video.mp4?lr=watermarked")).toBe(true);
     expect(videoSourceHasWatermark("https://example.com/video.mp4")).toBe(false);
+  });
+
+  it("reads both observed Doubao wait-time messages", () => {
+    expect(parseExpectedVideoWaitMinutes("预计等待 5 分钟")).toBe(5);
+    expect(parseExpectedVideoWaitMinutes("本次使用 Seedance 2.0 Mini 生成，大约需要 1-3 分钟")).toBe(3);
+    expect(parseExpectedVideoWaitMinutes("预计 等待\u200b 8 分钟")).toBe(8);
   });
 });

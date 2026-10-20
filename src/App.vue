@@ -494,7 +494,7 @@ async function openTask(task: TaskRecord) {
   await act(async () => {
     await window.desktopApi.tasks.open(task.id);
     const frameNote = task.firstFrameSource === "none" ? "" : "，已自动上传锁定首帧";
-    const referenceNote = projectHasReferences(task.projectName) ? "；项目参考图目前仍需手动上传" : "";
+    const referenceNote = projectHasReferences(task.projectName) ? "；视频阶段未额外上传项目参考图" : "";
     flash(`已打开豆包视频页并自动填入合成提示词${frameNote}${referenceNote}${settings.value.autoClickGenerate ? '，核对通过后已自动点击生成' : '，请确认后点击生成'}`);
   });
 }
@@ -502,7 +502,8 @@ async function openTask(task: TaskRecord) {
 async function openImageTask(task: TaskRecord) {
   await act(async () => {
     await window.desktopApi.tasks.openImage(task.id);
-    const referenceNote = projectHasReferences(task.projectName) ? "；请手动上传项目参考图" : "";
+    const profile = projectStyleByName.value.get(task.projectName);
+    const referenceNote = profile?.characterReferencePaths.length ? `；已自动上传 ${profile.characterReferencePaths.length} 张角色参考图` : "";
     flash(`已打开豆包生图页并自动填入合成提示词${referenceNote}${settings.value.autoClickGenerate ? '，核对通过后已自动点击生成' : '，请确认后点击生成'}`);
   });
 }
@@ -902,10 +903,15 @@ function importPromptBreakdown(shot: ImportedShot, stage: PromptStage) {
 }
 
 function preparationSteps(task: TaskRecord, stage: "image" | "video") {
-  if (stage === "image") return ["检查前置条件", "打开生图页", "设置图片比例", "填写提示词", "等待你在豆包点击生成", "生图中", "下载分镜图候选"];
+  const submitStep = settings.value.autoClickGenerate ? "自动点击生成" : "等待你在豆包点击生成";
+  if (stage === "image") {
+    const steps = ["检查前置条件", "打开生图页", "进入图像生成", "设置图片比例"];
+    if (projectStyleByName.value.get(task.projectName)?.characterReferencePaths.length) steps.push("上传参考图");
+    return [...steps, "填写提示词", submitStep, "生图中", "下载分镜图候选"];
+  }
   const steps = ["检查前置条件", "打开视频页", "进入视频生成", "设置模型、比例和时长"];
   if (task.firstFrameSource !== "none") steps.push("上传首帧", "等待首帧缩略图");
-  return [...steps, "填写提示词", "回读并核对模型、比例和时长", "等待你在豆包点击生成", "视频生成中", "下载原视频"];
+  return [...steps, "填写提示词", "回读并核对模型、比例和时长", submitStep, "视频生成中", "下载原视频"];
 }
 
 function preparationStepClass(task: TaskRecord, stage: "image" | "video", step: string) {
@@ -1058,7 +1064,8 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                 <div class="task-group-head">
                   <div><strong>{{ group.name }}</strong><span>{{ taskGroupSummary(group.tasks) }}</span></div>
                   <div class="project-actions">
-                    <span v-if="projectHasReferences(group.projectName)" class="reference-project-warning">参考图需手动上传到豆包</span>
+                    <span v-if="projectStyleByName.get(group.projectName)?.characterReferencePaths.length" class="reference-project-warning">角色参考图将在生图时自动上传</span>
+                    <span v-else-if="projectHasReferences(group.projectName)" class="reference-project-warning">场景 / 风格参考图仍需手动上传</span>
                     <button v-if="group.projectName" class="style-lock-button" :class="{ active: hasProjectStyle(projectStyleByName.get(group.projectName)) }" @click="openProjectStyle(group.projectName)">
                       {{ hasProjectStyle(projectStyleByName.get(group.projectName)) ? '已设全局约束' : '设置全局约束' }}
                     </button>
@@ -1095,7 +1102,8 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                       <span>模型：{{ task.model }}（{{ parameterSourceLabel(task.modelSource) }}）</span>
                       <span>时长：{{ durationLabel(task.duration) }}（{{ parameterSourceLabel(task.durationSource) }}）</span>
                       <span>画幅：{{ aspectRatioLabel(task.aspectRatio) }}（{{ parameterSourceLabel(task.aspectRatioSource) }}）</span>
-                      <span>生成次数：{{ task.generationCount }}</span>
+                      <span>计划候选：{{ task.generationCount }} 次</span>
+                      <span>实际轮次：生图 {{ task.imageGenerationCount }} · 视频 {{ task.videoGenerationCount }}</span>
                     </div>
                     <p v-if="task.imagePath" class="image-path" :title="task.imagePath">已关联：{{ task.firstFrameFileName || fileName(task.imagePath) }}</p>
                     <section v-if="task.imageCandidates.length" class="candidate-section">
@@ -1215,7 +1223,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
           <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
           <label>口播 / 旁白（选填，不参与提示词）<textarea v-model="taskForm.narration" rows="2" placeholder="后续可用于字幕或配音稿"></textarea></label>
           <label>备注（选填，不参与提示词）<textarea v-model="taskForm.notes" rows="2"></textarea></label>
-          <label>生成次数（候选数量）<input v-model.number="taskForm.generationCount" type="number" min="1" max="20" step="1" /></label>
+          <label>计划生成次数（候选数量）<input v-model.number="taskForm.generationCount" type="number" min="1" max="20" step="1" /></label>
         </div>
 
         <div class="form-row">
@@ -1302,7 +1310,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
             <div><button type="button" @click="chooseProjectReference('style')">选择</button><button v-if="styleForm.styleReferencePath" type="button" @click="clearProjectReference('style')">清除</button></div>
           </article>
         </div>
-        <p v-if="styleForm.characterReferencePaths.length || styleForm.sceneReferencePath || styleForm.styleReferencePath" class="reference-upload-warning">参考图需手动上传到豆包；工作台会保留缩略图和原文件名用于核对，但不会把这些图片自动加入豆包输入框。</p>
+        <p v-if="styleForm.characterReferencePaths.length || styleForm.sceneReferencePath || styleForm.styleReferencePath" class="reference-upload-warning">角色参考图会在生图时按顺序自动上传，全部成功后才写入“参考素材约束”；视频阶段暂不额外上传项目参考图。场景和风格参考图仍需手动上传。</p>
 
         <article class="project-output-card">
           <strong>项目输出目录</strong>

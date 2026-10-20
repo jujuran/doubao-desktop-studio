@@ -10,6 +10,12 @@ export function composeDeliveryPrompt(stage: PromptStage, shotPrompt: string, pr
   return compose(stage, shotPrompt, profile, false);
 }
 
+export const IMAGE_REFERENCE_MATERIAL_CONSTRAINT = "参考素材约束：请以已上传的角色参考图为准，保持同一角色的品种、体型、毛色分布、五官、耳朵、尾巴和配饰一致；不要新增、替换或混合角色。";
+
+export function appendImageReferenceConstraint(prompt: string) {
+  return [prompt.trim(), IMAGE_REFERENCE_MATERIAL_CONSTRAINT].filter(Boolean).join("\n\n");
+}
+
 function compose(stage: PromptStage, shotPrompt: string, profile: ProjectStyleProfile | null | undefined, headings: boolean) {
   if (!profile || profile.migrationPending || !hasProjectStyle(profile)) return shotPrompt.trim();
   const globalPrompt = projectStagePrompt(stage, profile);

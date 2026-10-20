@@ -49,6 +49,14 @@ export function videoSourceHasWatermark(sourceUrl: string) {
   return /video_gen_watermark|video_dsz_watermark|watermark_dyn|(?:^|[\/_?&=.-])watermarked(?:$|[\/_?&=.-])/.test(normalized);
 }
 
+export function parseExpectedVideoWaitMinutes(bodyText: string) {
+  const compact = bodyText.replace(/[\u00a0\u2000-\u200b]/g, " ");
+  const exact = /预\s*计\s*等\s*待\s*(\d+)\s*分\s*钟/i.exec(compact);
+  if (exact) return Number(exact[1]);
+  const range = /大\s*约\s*需\s*要\s*(\d+)\s*[-–—至~～]\s*(\d+)\s*分\s*钟/i.exec(compact);
+  return range ? Math.max(Number(range[1]), Number(range[2])) : 0;
+}
+
 export function normalizedModelName(value: string) {
   return value
     .replace(/模型/gi, "")

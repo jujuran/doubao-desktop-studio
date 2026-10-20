@@ -324,12 +324,16 @@ describe("StudioDatabase", () => {
       aspectRatio: "16:9"
     });
     const withImage = db.addTaskCandidates(task.id, "image", 1, [{ sourceUrl: "https://example/image.png", filePath: image }]);
+    expect(withImage.imageGenerationCount).toBe(1);
+    expect(withImage.videoGenerationCount).toBe(0);
     const approved = db.approveImageCandidate(withImage.imageCandidates[0].id);
     expect(approved.imageStatus).toBe("approved");
     expect(approved.imageCandidates[0].reviewStatus).toBe("approved");
     expect(existsSync(approved.imagePath!)).toBe(true);
 
     const withVideo = db.addTaskCandidates(task.id, "video", 1, [{ sourceUrl: "https://example/video.mp4", filePath: video, hasWatermark: true }]);
+    expect(withVideo.imageGenerationCount).toBe(1);
+    expect(withVideo.videoGenerationCount).toBe(1);
     const rejected = db.reviewVideoCandidate(withVideo.videoCandidates[0].id, false);
     expect(rejected.status).toBe("queued");
     expect(rejected.videoCandidates[0].reviewStatus).toBe("rejected");
@@ -366,7 +370,8 @@ describe("StudioDatabase", () => {
     expect(updated.status).toBe("succeeded");
     expect(updated.resultPath).toBe(approvedPath);
     expect(updated.videoPrepareStep).toContain("已通过");
-    expect(updated.generationCount).toBe(2);
+    expect(updated.videoGenerationCount).toBe(2);
+    expect(updated.imageGenerationCount).toBe(0);
     db.close();
   });
 
@@ -403,6 +408,8 @@ describe("StudioDatabase", () => {
     expect(target.folder).toBe(path.join(outputDirectory, "视频"));
     expect(target.baseName).toContain("账号1");
     expect(target.baseName).not.toContain("账号 1");
+    const imageTarget = db.generationTarget(task.id, "image", "账号 1");
+    expect(imageTarget.baseName).toBe("输出测试_分镜03_第1次");
     db.close();
   });
 

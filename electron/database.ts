@@ -57,6 +57,8 @@ export class StudioDatabase {
         narration TEXT NOT NULL DEFAULT '',
         notes TEXT NOT NULL DEFAULT '',
         generation_count INTEGER NOT NULL DEFAULT 1,
+        image_generation_count INTEGER NOT NULL DEFAULT 0,
+        video_generation_count INTEGER NOT NULL DEFAULT 0,
         first_frame_source TEXT NOT NULL DEFAULT 'none',
         first_frame_file_name TEXT,
         image_prompt TEXT NOT NULL DEFAULT '',
@@ -147,6 +149,8 @@ export class StudioDatabase {
     if (!taskColumns.has("narration")) this.db.exec("ALTER TABLE tasks ADD COLUMN narration TEXT NOT NULL DEFAULT ''");
     if (!taskColumns.has("notes")) this.db.exec("ALTER TABLE tasks ADD COLUMN notes TEXT NOT NULL DEFAULT ''");
     if (!taskColumns.has("generation_count")) this.db.exec("ALTER TABLE tasks ADD COLUMN generation_count INTEGER NOT NULL DEFAULT 1");
+    if (!taskColumns.has("image_generation_count")) this.db.exec("ALTER TABLE tasks ADD COLUMN image_generation_count INTEGER NOT NULL DEFAULT 0");
+    if (!taskColumns.has("video_generation_count")) this.db.exec("ALTER TABLE tasks ADD COLUMN video_generation_count INTEGER NOT NULL DEFAULT 0");
     if (!taskColumns.has("model_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN model_source TEXT NOT NULL DEFAULT 'shot'");
     if (!taskColumns.has("duration_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN duration_source TEXT NOT NULL DEFAULT 'shot'");
     if (!taskColumns.has("aspect_ratio_source")) this.db.exec("ALTER TABLE tasks ADD COLUMN aspect_ratio_source TEXT NOT NULL DEFAULT 'shot'");
@@ -182,6 +186,11 @@ export class StudioDatabase {
         ELSE 'none'
       END
       WHERE first_frame_source IS NULL OR first_frame_source = 'none'
+    `);
+    this.db.exec(`
+      UPDATE tasks SET
+        image_generation_count = COALESCE((SELECT MAX(generation_index) FROM media_candidates WHERE task_id = tasks.id AND kind = 'image'), 0),
+        video_generation_count = COALESCE((SELECT MAX(generation_index) FROM media_candidates WHERE task_id = tasks.id AND kind = 'video'), 0)
     `);
 
     const projectStyleColumns = new Set(
@@ -322,7 +331,7 @@ export class StudioDatabase {
     const folder = path.join(projectRoot, kind === "image" ? "分镜图" : "视频");
     mkdirSync(folder, { recursive: true });
     const baseName = kind === "image"
-      ? `${project}_分镜${shot}`
+      ? `${project}_分镜${shot}_第${generationIndex}次`
       : `${project}_分镜${shot}_${safeFilePart(accountLabel).replace(/\s+/g, "")}_第${generationIndex}次`;
     return { folder, baseName, generationIndex };
   }
@@ -341,7 +350,8 @@ export class StudioDatabase {
     items.forEach((item, index) => insert.run(
       randomUUID(), taskId, kind, generationIndex, index + 1, item.sourceUrl, item.filePath, item.hasWatermark ? 1 : 0, now()
     ));
-    this.db.prepare("UPDATE tasks SET generation_count = MAX(generation_count, ?), updated_at = ? WHERE id = ?")
+    const countColumn = kind === "image" ? "image_generation_count" : "video_generation_count";
+    this.db.prepare(`UPDATE tasks SET ${countColumn} = MAX(${countColumn}, ?), updated_at = ? WHERE id = ?`)
       .run(generationIndex, now(), taskId);
     return this.getTask(taskId);
   }
@@ -1000,6 +1010,8 @@ function rowToTask(row: DbRow): TaskRecord {
     narration: String(row.narration || ""),
     notes: String(row.notes || ""),
     generationCount: Math.min(20, Math.max(1, Number(row.generation_count) || 1)),
+    imageGenerationCount: Math.max(0, Number(row.image_generation_count) || 0),
+    videoGenerationCount: Math.max(0, Number(row.video_generation_count) || 0),
     firstFrameSource: String(row.first_frame_source || (row.image_prompt ? "generated" : row.image_path ? "local" : "none")) as FirstFrameSource,
     firstFrameFileName: row.first_frame_file_name ? String(row.first_frame_file_name) : null,
     imagePrompt: row.image_prompt ? String(row.image_prompt) : "",

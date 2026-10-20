@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProjectStyleProfile } from "../electron/contracts";
-import { composeDeliveryPrompt, composeProjectPrompt, hasProjectStyle } from "../src/prompt-compose";
+import { appendImageReferenceConstraint, composeDeliveryPrompt, composeProjectPrompt, hasProjectStyle, IMAGE_REFERENCE_MATERIAL_CONSTRAINT } from "../src/prompt-compose";
 
 const profile: ProjectStyleProfile = {
   projectName: "测试短片",
@@ -43,5 +43,11 @@ describe("project prompt composition", () => {
 
   it("keeps migrated legacy drafts inactive until they are confirmed", () => {
     expect(composeProjectPrompt("video", "原始提示词", { ...profile, migrationPending: true })).toBe("原始提示词");
+  });
+
+  it("adds the reference constraint only after character references are uploaded", () => {
+    const prompt = appendImageReferenceConstraint("柯基坐在地毯上");
+    expect(prompt).toBe(`柯基坐在地毯上\n\n${IMAGE_REFERENCE_MATERIAL_CONSTRAINT}`);
+    expect(prompt).not.toContain("16:9");
   });
 });

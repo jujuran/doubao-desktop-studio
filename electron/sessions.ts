@@ -14,14 +14,15 @@ import {
   normalizedModelName,
   parseDoubaoImageAspectText,
   parseDoubaoVideoParameterText,
+  parseExpectedVideoWaitMinutes,
   videoSourceHasWatermark,
   type DoubaoVideoModeSnapshot,
   type DoubaoVideoSettings
 } from "../src/doubao-video.js";
+import { appendImageReferenceConstraint } from "../src/prompt-compose.js";
 
 const DOUBAO_HOME = "https://www.doubao.com/";
 const DOUBAO_CHAT = "https://www.doubao.com/chat/";
-const DOUBAO_IMAGE = "https://www.doubao.com/chat/create-image";
 const DOUBAO_ACCOUNT_INFO = "/passport/account/info/v2/?aid=497858&account_sdk_source=web&sdk_version=2.2.11-doubao.0&device_platform=web";
 const LOGIN_CHECK_INTERVAL = 10_000;
 const HEALTH_CHECK_INTERVAL = 5 * 60_000;
@@ -149,8 +150,10 @@ export class AccountSessionManager {
     attachmentPath: string | null = null,
     videoSettings?: DoubaoVideoSettings,
     imageAspectRatio?: string,
-    onProgress?: (progress: PreparationProgress) => void
+    onProgress?: (progress: PreparationProgress) => void,
+    imageReferencePaths: string[] = []
   ) {
+    let preparedPrompt = prompt;
     onProgress?.({ stage: route, state: "running", step: route === "video" ? "打开视频页" : "打开生图页" });
     const win = this.open(account, route, true);
     await waitForLoad(win);
@@ -195,15 +198,22 @@ export class AccountSessionManager {
       await runImageStep("设置图片比例", prompt, () => applyImageAspectRatio(win, imageAspectRatio), (level, event, details) => {
         this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "设置图片比例", ...details });
       });
+      if (imageReferencePaths.length) {
+        onProgress?.({ stage: "image", state: "running", step: "上传参考图" });
+        await runImageStep("上传参考图", prompt, () => attachReferenceImages(win, imageReferencePaths), (level, event, details) => {
+          this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "上传参考图", referenceCount: imageReferencePaths.length, ...details });
+        });
+        preparedPrompt = appendImageReferenceConstraint(prompt);
+      }
       if (attachmentPath) await attachFirstFrame(win, attachmentPath);
       onProgress?.({ stage: "image", state: "running", step: "填写提示词" });
-      await runImageStep("填写提示词", prompt, async () => {
-        if (!await fillAndConfirmComposer(win, prompt)) throw new Error("豆包输入框未能保留提示词");
+      await runImageStep("填写提示词", preparedPrompt, async () => {
+        if (!await fillAndConfirmComposer(win, preparedPrompt)) throw new Error("豆包输入框未能精确保留提示词");
       }, (level, event, details) => {
         this.events.onDiagnostic(level, event, { accountId: shortAccountId(account.id), step: "填写提示词", ...details });
       });
     }
-    return win;
+    return { win, prompt: preparedPrompt };
   }
 
   async monitorGeneration(account: Account, options: GenerationMonitorOptions): Promise<DownloadedGenerationCandidate[]> {
@@ -211,6 +221,7 @@ export class AccountSessionManager {
     if (!win || win.isDestroyed()) throw new Error("豆包窗口已关闭，无法监测生成结果");
     const baseline = await readGenerationSnapshot(win, options.route);
     if (options.autoClick) {
+      options.onProgress?.("waiting", "自动点击生成");
       await verifyBeforeSubmit(win, options);
       if (!await clickGenerateButton(win)) throw new Error("生成前核对已通过，但没有找到可点击的生成按钮");
     } else {
@@ -456,7 +467,7 @@ async function readImageAspectCandidates(win: BrowserWindow) {
 
 function routeUrl(route: "home" | "chat" | "image" | "video") {
   if (route === "chat") return DOUBAO_CHAT;
-  if (route === "image") return DOUBAO_IMAGE;
+  if (route === "image") return DOUBAO_HOME;
   if (route === "video") return DOUBAO_HOME;
   return DOUBAO_HOME;
 }
@@ -494,6 +505,15 @@ async function attachFirstFrame(win: BrowserWindow, filePath: string) {
     await delay(400);
   }
   throw new Error(`没有找到可用的首帧图片上传控件${lastError ? `：${errorMessage(lastError)}` : ""}`);
+}
+
+async function attachReferenceImages(win: BrowserWindow, filePaths: string[]) {
+  for (let index = 0; index < filePaths.length; index += 1) {
+    const previousThumbnailCount = await attachFirstFrame(win, filePaths[index]);
+    if (!await waitForUploadedThumbnail(win, previousThumbnailCount)) {
+      throw new Error(`第 ${index + 1} 张角色参考图上传后没有检测到缩略图`);
+    }
+  }
 }
 
 async function enterVideoGeneration(win: BrowserWindow) {
@@ -1187,6 +1207,7 @@ async function waitForGenerationCompletion(
   const startedAt = Date.now();
   let expectedMinutes = 0;
   let lastProgressMinute = -1;
+  let lastExpectedMinutes = -1;
   let overdueReported = false;
   const beforeImages = new Set(baseline.imageUrls);
   while (route === "video" || Date.now() < deadline) {
@@ -1205,13 +1226,14 @@ async function waitForGenerationCompletion(
       return current;
     }
     if (route === "video") {
-      expectedMinutes = parseExpectedWaitMinutes(current.bodyText) || expectedMinutes;
+      expectedMinutes = parseExpectedVideoWaitMinutes(current.bodyText) || expectedMinutes;
       const elapsedMinutes = Math.floor((Date.now() - startedAt) / 60_000);
       if (failure) onProgress?.("waiting", `${failure.replace("豆包报告生成失败：", "豆包提示：")} · 仍在继续监听`);
-      else if (elapsedMinutes !== lastProgressMinute) {
+      else if (elapsedMinutes !== lastProgressMinute || expectedMinutes !== lastExpectedMinutes) {
         const estimate = expectedMinutes ? `预计 ${expectedMinutes} 分钟 · ` : "";
         onProgress?.("started", `${estimate}已等 ${elapsedMinutes} 分钟`);
         lastProgressMinute = elapsedMinutes;
+        lastExpectedMinutes = expectedMinutes;
       }
       const overdueMinutes = Math.max(30, expectedMinutes * 2);
       if (elapsedMinutes >= overdueMinutes && !overdueReported) {
@@ -1222,14 +1244,6 @@ async function waitForGenerationCompletion(
     await delay(route === "image" ? 1_500 : 3_000);
   }
   throw new Error("等待分镜图生成完成超时");
-}
-
-function parseExpectedWaitMinutes(bodyText: string) {
-  const recent = bodyText.slice(-6_000);
-  const exact = /预计等待\s*(\d+)\s*分钟/.exec(recent);
-  if (exact) return Number(exact[1]);
-  const range = /大约需要\s*(\d+)\s*[-–—至]\s*(\d+)\s*分钟/.exec(recent);
-  return range ? Math.max(Number(range[1]), Number(range[2])) : 0;
 }
 
 function generationFailure(bodyText: string) {
@@ -1251,7 +1265,12 @@ async function openLatestVideoPreview(win: BrowserWindow) {
   await clickPoint(win, point.x, point.y);
   await waitUntil(async () => {
     await pauseAndMuteVideos(win);
-    return hasDownloadControl(win);
+    return win.webContents.executeJavaScript(`
+      (() => Array.from(document.querySelectorAll('video')).some(video => {
+        const rect = video.getBoundingClientRect();
+        return rect.width > 120 && rect.height > 80;
+      }))()
+    `, true) as Promise<boolean>;
   }, 15_000, 400);
 }
 
@@ -1268,33 +1287,64 @@ async function pauseAndMuteVideos(win: BrowserWindow) {
   `, true);
 }
 
-async function hasDownloadControl(win: BrowserWindow) {
-  return win.webContents.executeJavaScript(`
-    (() => {
-      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
-      return Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]')).filter(visible).some(element => /下载/.test((element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, '')));
-    })()
-  `, true) as Promise<boolean>;
-}
-
 async function clickOfficialDownloadControl(win: BrowserWindow, onStarted: () => boolean) {
-  if (await clickVisibleText(win, ["下载原片"], true)) return true;
-  const point = await win.webContents.executeJavaScript(`
+  const labelledPoint = await win.webContents.executeJavaScript(`
     (() => {
       const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
-      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]')).filter(visible).map(element => {
-        const text = (element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, '').trim();
+      const describe = element => [
+        element.textContent,
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.getAttribute('data-tooltip'),
+        element.getAttribute('data-testid'),
+        typeof element.className === 'string' ? element.className : '',
+        ...Array.from(element.querySelectorAll('svg, use, path')).flatMap(node => [node.getAttribute('aria-label'), node.getAttribute('title'), node.getAttribute('data-icon'), node.getAttribute('href'), node.getAttribute('xlink:href')])
+      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+      const videos = Array.from(document.querySelectorAll('video')).filter(visible).map(video => video.getBoundingClientRect());
+      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex], [data-testid*="download" i], [class*="download" i]')).filter(visible).map(element => {
+        const label = describe(element);
         const rect = element.getBoundingClientRect();
-        return { text, x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), area: rect.width * rect.height };
-      }).filter(item => /^下载(?:原片|视频)?$/.test(item.text)).sort((a, b) => a.area - b.area);
+        const nearVideo = videos.some(video => rect.left >= video.left - 120 && rect.left <= video.right + 180 && rect.top >= video.top - 140 && rect.top <= video.bottom + 80);
+        const previewScore = rect.left > innerWidth * .5 ? 20 : 0;
+        const topScore = rect.top < 280 ? 10 : 0;
+        return { label, x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), area: rect.width * rect.height, score: (nearVideo ? 100 : 0) + previewScore + topScore };
+      }).filter(item => item.score >= 100 && /下载|download/i.test(item.label) && !/下载豆包|下载电脑版|desktop/i.test(item.label)).sort((a, b) => b.score - a.score || a.area - b.area);
       return candidates[0] || null;
     })()
   `, true) as { x: number; y: number } | null;
-  if (!point) return false;
-  await clickPoint(win, point.x, point.y);
-  await delay(500);
-  if (!onStarted() && await hasVisibleText(win, ["下载原片"], true)) await clickVisibleText(win, ["下载原片"], true);
-  return true;
+  if (labelledPoint) {
+    await clickPoint(win, labelledPoint.x, labelledPoint.y);
+    await delay(600);
+    if (!onStarted() && await hasVisibleText(win, ["下载原片"], true)) await clickVisibleText(win, ["下载原片"], true);
+    return true;
+  }
+
+  const candidates = await win.webContents.executeJavaScript(`
+    (() => {
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width >= 16 && r.height >= 16 && r.width <= 72 && r.height <= 72 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const videos = Array.from(document.querySelectorAll('video')).filter(video => { const r = video.getBoundingClientRect(); return r.width > 120 && r.height > 80; }).map(video => video.getBoundingClientRect());
+      return Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]')).filter(visible).map(element => {
+        const rect = element.getBoundingClientRect();
+        const nearVideo = videos.some(video => rect.left >= video.left - 120 && rect.left <= video.right + 180 && rect.top >= video.top - 140 && rect.top <= video.bottom + 80);
+        return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), score: (nearVideo ? 100 : 0) + (rect.left > innerWidth * .55 ? 20 : 0) + (rect.top < 280 ? 10 : 0) };
+      }).filter(item => item.score >= 100).sort((a, b) => b.score - a.score).slice(0, 24);
+    })()
+  `, true) as Array<{ x: number; y: number }>;
+  for (const candidate of candidates) {
+    win.webContents.sendInputEvent({ type: "mouseMove", x: candidate.x, y: candidate.y });
+    await delay(350);
+    const tooltip = await win.webContents.executeJavaScript(`
+      (() => {
+        const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+        return Array.from(document.querySelectorAll('[role="tooltip"], [class*="tooltip" i], [class*="popper" i]')).filter(visible).map(element => element.textContent || '').join(' ').replace(/\\s+/g, ' ').trim();
+      })()
+    `, true) as string;
+    if (/下载|download/i.test(tooltip)) {
+      await clickPoint(win, candidate.x, candidate.y);
+      return true;
+    }
+  }
+  return false;
 }
 
 async function downloadOfficialOriginal(win: BrowserWindow, outputFolder: string, baseName: string): Promise<DownloadedGenerationCandidate> {
@@ -1325,14 +1375,15 @@ async function runOfficialDownloadAttempt(win: BrowserWindow, savePath: string) 
   const downloadSession = win.webContents.session;
   let started = false;
   let listener: ((_event: Event, item: DownloadItem) => void) | null = null;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
   const download = new Promise<{ sourceUrl: string; filePath: string }>((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    timeout = setTimeout(() => {
       if (listener) downloadSession.removeListener("will-download", listener);
       reject(new Error("点击官方下载入口后 30 秒内没有收到下载任务，下载页已保留"));
     }, 30_000);
     listener = (_event, item) => {
       started = true;
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       item.setSavePath(savePath);
       item.once("done", (_doneEvent, state) => {
         if (state !== "completed") reject(new Error(`官方下载失败（${state}），下载页已保留`));
@@ -1342,8 +1393,9 @@ async function runOfficialDownloadAttempt(win: BrowserWindow, savePath: string) 
     downloadSession.once("will-download", listener);
   });
   if (!await clickOfficialDownloadControl(win, () => started)) {
+    if (timeout) clearTimeout(timeout);
     if (listener) downloadSession.removeListener("will-download", listener);
-    throw new Error("下载页没有找到官方“下载原片”入口，页面已保留");
+    throw new Error("没有识别到豆包视频下载图标或“下载”提示，页面已保留");
   }
   return download;
 }
