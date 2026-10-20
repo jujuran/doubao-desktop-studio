@@ -28,7 +28,12 @@ let mainWindow: BrowserWindow | null = null;
 let database: StudioDatabase;
 let diagnostics: DiagnosticsLogger;
 let sessions: AccountSessionManager;
-const activeGenerationMonitors = new Set<string>();
+interface GenerationMonitorToken {
+  cancelled: boolean;
+}
+
+const activeGenerationMonitors = new Map<string, GenerationMonitorToken>();
+const activeImagePreparations = new Map<string, GenerationMonitorToken>();
 
 function createMainWindow() {
   const win = new BrowserWindow({
@@ -155,6 +160,12 @@ function registerIpc() {
   });
   ipcMain.handle("tasks:open-image", async (_event, id: string) => {
     const task = database.getTask(id);
+    const previousMonitor = activeGenerationMonitors.get(`${id}:image`);
+    if (previousMonitor) previousMonitor.cancelled = true;
+    const previousPreparation = activeImagePreparations.get(id);
+    if (previousPreparation) previousPreparation.cancelled = true;
+    const preparationToken: GenerationMonitorToken = { cancelled: false };
+    activeImagePreparations.set(id, preparationToken);
     database.setTaskPreparation(id, "image", "running", "检查前置条件");
     notifyChanged();
     try {
@@ -164,13 +175,17 @@ function registerIpc() {
       const account = database.getAccount(task.imageAccountId);
       const projectStyle = database.getProjectStyle(task.projectName);
       const basePrompt = composeDeliveryPrompt("image", task.imagePrompt, projectStyle);
-      database.setTaskImageStatus(id, "preparing");
       database.setTaskPreparation(id, "image", "running", "打开生图页");
       notifyChanged();
       const prepared = await sessions.prepare(account, "image", basePrompt, null, undefined, task.aspectRatio, (progress) => {
         database.setTaskPreparation(id, "image", progress.state, progress.step);
         notifyChanged();
       }, projectStyle?.characterReferencePaths ?? []);
+      if (preparationToken.cancelled) {
+        const cancelled = database.restoreLockedImageState(id, "已取消重新生图，继续使用已锁定首帧");
+        notifyChanged();
+        return cancelled;
+      }
       clipboard.writeText(prepared.prompt);
       const autoClick = database.getSettings().autoClickGenerate;
       const updated = database.setTaskPreparation(id, "image", "ready", autoClick ? "自动点击生成" : "等待你在豆包点击生成");
@@ -178,12 +193,24 @@ function registerIpc() {
       notifyChanged();
       return updated;
     } catch (error) {
+      if (preparationToken.cancelled) {
+        const cancelled = database.restoreLockedImageState(id, "已取消重新生图，继续使用已锁定首帧");
+        notifyChanged();
+        return cancelled;
+      }
       const message = errorMessage(error);
       const current = database.getTask(id);
-      if (task.firstFrameSource === "generated") database.setTaskImageStatus(id, "failed");
-      const updated = database.setTaskPreparation(id, "image", "failed", current.imagePrepareStep || "打开生图页", message);
+      let updated: ReturnType<StudioDatabase["getTask"]>;
+      if (task.imageStatus === "approved" && task.imagePath) {
+        updated = database.restoreLockedImageState(id, "重新生图未开始，继续使用已锁定首帧");
+      } else {
+        if (task.firstFrameSource === "generated") database.setTaskImageStatus(id, "failed");
+        updated = database.setTaskPreparation(id, "image", "failed", current.imagePrepareStep || "打开生图页", message);
+      }
       notifyChanged();
       throw Object.assign(new Error(message), { task: updated });
+    } finally {
+      if (activeImagePreparations.get(id) === preparationToken) activeImagePreparations.delete(id);
     }
   });
   ipcMain.handle("tasks:choose-image", async (event, id: string) => {
@@ -203,6 +230,31 @@ function registerIpc() {
     const task = database.setTaskImage(id, selectedPath, inferAspectRatio(size.width, size.height));
     notifyChanged();
     return task;
+  });
+  ipcMain.handle("tasks:import-image-candidate", async (event, id: string) => {
+    database.getTask(id);
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+    const options: Electron.OpenDialogOptions = {
+      title: "导入已生成的分镜图候选",
+      buttonLabel: "导入候选",
+      properties: ["openFile"],
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }]
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return null;
+    const updated = database.importImageCandidate(id, result.filePaths[0]);
+    notifyChanged();
+    return updated;
+  });
+  ipcMain.handle("tasks:cancel-image-regeneration", (_event, id: string) => {
+    const token = activeGenerationMonitors.get(`${id}:image`);
+    if (token) token.cancelled = true;
+    const preparationToken = activeImagePreparations.get(id);
+    if (preparationToken) preparationToken.cancelled = true;
+    const updated = database.restoreLockedImageState(id, "已取消重新生图，继续使用已锁定首帧");
+    diagnostics.info("image_regeneration_cancelled", { taskId: shortTaskId(id) });
+    notifyChanged();
+    return updated;
   });
   ipcMain.handle("tasks:update-image-status", (_event, id: string, status: ImageTaskStatus) => {
     const task = database.setTaskImageStatus(id, status);
@@ -481,12 +533,15 @@ async function prepareVideoTask(id: string) {
 
 function startGenerationMonitor(taskId: string, route: "image" | "video", accountId: string, prompt: string) {
   const monitorKey = `${taskId}:${route}`;
-  if (activeGenerationMonitors.has(monitorKey)) return;
-  activeGenerationMonitors.add(monitorKey);
+  const previous = activeGenerationMonitors.get(monitorKey);
+  if (previous) previous.cancelled = true;
+  const token: GenerationMonitorToken = { cancelled: false };
+  activeGenerationMonitors.set(monitorKey, token);
   const task = database.getTask(taskId);
   const account = database.getAccount(accountId);
   const target = database.generationTarget(taskId, route, account.label);
   const autoClick = database.getSettings().autoClickGenerate;
+  let generationStarted = false;
   void sessions.monitorGeneration(account, {
     route,
     prompt,
@@ -497,8 +552,10 @@ function startGenerationMonitor(taskId: string, route: "image" | "video", accoun
     imageAspectRatio: route === "image" ? task.aspectRatio : undefined,
     videoSettings: route === "video" ? { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio } : undefined,
     expectsFirstFrame: route === "video" && task.firstFrameSource !== "none",
+    shouldCancel: () => token.cancelled,
     onProgress(state, step) {
       try {
+        if (state === "started") generationStarted = true;
         if (state === "waiting") database.setTaskPreparation(taskId, route, "ready", step);
         if (state === "started" && route === "image") {
           database.setTaskImageStatus(taskId, "submitted");
@@ -536,14 +593,32 @@ function startGenerationMonitor(taskId: string, route: "image" | "video", accoun
   }).catch((error) => {
     const message = errorMessage(error);
     if (route === "image") {
-      try { database.setTaskImageStatus(taskId, "failed"); } catch {}
+      if (token.cancelled) {
+        try { database.restoreLockedImageState(taskId, "已取消重新生图，继续使用已锁定首帧"); } catch {}
+        diagnostics.info("generation_monitor_cancelled", { taskId: shortTaskId(taskId), route });
+        notifyChanged();
+        return;
+      }
+      if (!generationStarted && task.imageStatus === "approved" && task.imagePath && /窗口已关闭/.test(message)) {
+        try { database.restoreLockedImageState(taskId, "重新生图未提交，继续使用已锁定首帧"); } catch {}
+        diagnostics.info("image_regeneration_closed_before_submit", { taskId: shortTaskId(taskId) });
+        notifyChanged();
+        return;
+      }
+      if (task.imageStatus === "approved" && task.imagePath) {
+        try { database.restoreLockedImageState(taskId, "重新生图未完成，已锁定首帧仍可用"); } catch {}
+      } else {
+        try { database.setTaskImageStatus(taskId, "failed"); } catch {}
+      }
     } else {
       database.setTaskStatus(taskId, "failed", message);
     }
-    database.setTaskPreparation(taskId, route, "failed", route === "image" ? "生图或下载失败" : "视频生成或下载失败", message);
+    database.setTaskPreparation(taskId, route, "failed", route === "image" ? "生图或下载失败（已锁定首帧未受影响）" : "视频生成或下载失败", message);
     diagnostics.error("generation_monitor_failed", { taskId: shortTaskId(taskId), route, message });
     notifyChanged();
-  }).finally(() => activeGenerationMonitors.delete(monitorKey));
+  }).finally(() => {
+    if (activeGenerationMonitors.get(monitorKey) === token) activeGenerationMonitors.delete(monitorKey);
+  });
 }
 
 app.whenReady().then(() => {

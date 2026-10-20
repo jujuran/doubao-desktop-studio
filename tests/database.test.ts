@@ -342,6 +342,43 @@ describe("StudioDatabase", () => {
     db.close();
   });
 
+  it("imports a generated image as a review candidate without replacing the locked frame", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-import-image-"));
+    tempDirs.push(dir);
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const locked = path.join(dir, "locked.png");
+    const imported = path.join(dir, "new.png");
+    writeFileSync(locked, "locked image");
+    writeFileSync(imported, "new image");
+    const task = db.createTask({
+      projectName: "导入候选",
+      shotNumber: 2,
+      firstFrameSource: "generated",
+      sourceImagePath: locked,
+      imagePrompt: "一只柯基",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基眼睛",
+      model: "Seedance 2.0 mini",
+      duration: 6,
+      aspectRatio: "16:9"
+    });
+    const oldPath = task.imagePath;
+    const updated = db.importImageCandidate(task.id, imported);
+    expect(updated.imageStatus).toBe("ready");
+    expect(updated.imagePath).toBe(oldPath);
+    expect(updated.imageGenerationCount).toBe(1);
+    expect(updated.imageCandidates).toHaveLength(1);
+    expect(updated.imageCandidates[0].reviewStatus).toBe("pending");
+    expect(path.basename(updated.imageCandidates[0].filePath)).toContain("第1次_候选1");
+    expect(existsSync(updated.imageCandidates[0].filePath)).toBe(true);
+    const restored = db.restoreLockedImageState(task.id, "已取消重新生图");
+    expect(restored.imageStatus).toBe("approved");
+    expect(restored.imagePath).toBe(oldPath);
+    expect(restored.imagePrepareStep).toBe("已取消重新生图");
+    db.close();
+  });
+
   it("keeps a task completed when a later video candidate is rejected", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-multi-candidates-"));
     tempDirs.push(dir);

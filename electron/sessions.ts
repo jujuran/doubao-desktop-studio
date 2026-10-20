@@ -20,6 +20,11 @@ import {
   type DoubaoVideoSettings
 } from "../src/doubao-video.js";
 import { appendImageReferenceConstraint } from "../src/prompt-compose.js";
+import {
+  imageReplyText,
+  newGeneratedImageUrls,
+  type DoubaoImageCandidateSnapshot
+} from "../src/doubao-image.js";
 
 const DOUBAO_HOME = "https://www.doubao.com/";
 const DOUBAO_CHAT = "https://www.doubao.com/chat/";
@@ -58,6 +63,7 @@ export interface GenerationMonitorOptions {
   videoSettings?: DoubaoVideoSettings;
   expectsFirstFrame?: boolean;
   onProgress?: (state: "waiting" | "started" | "completed", step: string) => void;
+  shouldCancel?: () => boolean;
 }
 
 export interface DownloadedGenerationCandidate {
@@ -220,6 +226,13 @@ export class AccountSessionManager {
     const win = this.windows.get(account.id);
     if (!win || win.isDestroyed()) throw new Error("豆包窗口已关闭，无法监测生成结果");
     const baseline = await readGenerationSnapshot(win, options.route);
+    if (options.route === "image") {
+      this.events.onDiagnostic("info", "image_generation_baseline", {
+        accountId: shortAccountId(account.id),
+        candidateCount: baseline.imageCandidates.length,
+        roleCounts: imageRoleCounts(baseline.imageCandidates)
+      });
+    }
     if (options.autoClick) {
       options.onProgress?.("waiting", "自动点击生成");
       await verifyBeforeSubmit(win, options);
@@ -229,10 +242,22 @@ export class AccountSessionManager {
     }
     const started = options.route === "video"
       ? await waitForVideoGenerationStart(win, baseline, options.autoClick, options.onProgress)
-      : await waitForGenerationStart(win, baseline, options.route, 30 * 60_000);
+      : await waitForGenerationStart(win, baseline, options.route, 30 * 60_000, options.shouldCancel);
     if (!started) throw new Error("等待手动点击生成超时，请重新打开任务");
     options.onProgress?.("started", options.route === "image" ? "生图中" : "视频生成中");
-    const completed = await waitForGenerationCompletion(win, baseline, options.route, options.onProgress);
+    const completed = await waitForGenerationCompletion(
+      win,
+      baseline,
+      options.route,
+      options.onProgress,
+      options.shouldCancel,
+      options.route === "image" ? (snapshot, urls) => this.events.onDiagnostic("info", "image_generation_result_detected", {
+        accountId: shortAccountId(account.id),
+        candidateCount: snapshot.imageCandidates.length,
+        roleCounts: imageRoleCounts(snapshot.imageCandidates),
+        newResultCount: urls.length
+      }) : undefined
+    );
     options.onProgress?.("completed", options.route === "image" ? "下载分镜图候选" : "下载原视频");
     mkdirSync(options.outputFolder, { recursive: true });
     if (options.route === "image") {
@@ -1042,6 +1067,7 @@ interface GenerationSnapshot {
   bodyText: string;
   composerText: string;
   imageUrls: string[];
+  imageCandidates: DoubaoImageCandidateSnapshot[];
   videoCardCount: number;
 }
 
@@ -1054,15 +1080,36 @@ async function readGenerationSnapshot(win: BrowserWindow, route: "image" | "vide
         return br.width * br.height - ar.width * ar.height;
       })[0];
       const composerText = composer ? (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement ? composer.value : (composer.innerText || composer.textContent || '')) : '';
-      const imageUrls = Array.from(document.images).filter(image => {
+      const imageCandidates = Array.from(document.images).filter(image => {
         const src = image.currentSrc || image.src || '';
-        return image.naturalWidth >= 512 && image.naturalHeight >= 512 && /rc_gen_image|cgen_wm0|imagex-sign/i.test(src) && !/avatar|emoji|icon|video_dsz/i.test(src);
-      }).map(image => image.currentSrc || image.src).filter((value, index, values) => value && values.indexOf(value) === index);
+        const rect = image.getBoundingClientRect();
+        return image.naturalWidth >= 256 && image.naturalHeight >= 256 && rect.width >= 96 && rect.height >= 96 &&
+          /^(?:https?:|blob:|data:image)/i.test(src) && !/avatar|emoji|icon|logo|video_dsz|sticker/i.test(src);
+      }).map(image => {
+        const src = image.currentSrc || image.src || '';
+        const composerRoot = composer ? composer.closest('form, [class*="input" i], [class*="composer" i], [class*="send" i]') : null;
+        const inComposer = Boolean((composerRoot && composerRoot.contains(image)) || image.closest('form, [class*="upload-preview" i], [class*="attachment-preview" i]'));
+        let role = 'unknown';
+        let contextText = '';
+        let node = image.parentElement;
+        for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+          const marker = [node.id, node.className, node.getAttribute('data-testid'), node.getAttribute('data-role'), node.getAttribute('data-message-author'), node.getAttribute('aria-label')]
+            .filter(value => typeof value === 'string').join(' ').toLowerCase();
+          if (role === 'unknown' && /assistant|bot|answer|receive|ai-message|message-ai/.test(marker)) role = 'assistant';
+          if (role === 'unknown' && /(?:^|[-_ ])user(?:$|[-_ ])|question|sent-message|message-user/.test(marker)) role = 'user';
+          const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+          if (text && text.length <= 2000) contextText = text;
+        }
+        if (role === 'unknown' && /(?:^|[\\s，。！])(?:已生成|生成完成|这版|为你生成)/.test(contextText)) role = 'assistant';
+        return { url: src, role, inComposer, contextText };
+      });
+      const imageUrls = imageCandidates.map(item => item.url).filter((value, index, values) => value && values.indexOf(value) === index);
       return {
         url: location.href,
         bodyText: document.body.innerText || '',
         composerText,
         imageUrls,
+        imageCandidates,
         videoCardCount: document.querySelectorAll('[class*="block-video"]').length
       };
     })()
@@ -1106,9 +1153,11 @@ async function waitForGenerationStart(
   win: BrowserWindow,
   baseline: GenerationSnapshot,
   route: "image" | "video",
-  timeout: number
+  timeout: number,
+  shouldCancel?: () => boolean
 ) {
   return waitUntil(async () => {
+    if (shouldCancel?.()) throw new Error("已取消重新生图");
     if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
     const current = await readGenerationSnapshot(win, route);
     const failure = generationFailure(current.bodyText);
@@ -1201,26 +1250,31 @@ async function waitForGenerationCompletion(
   win: BrowserWindow,
   baseline: GenerationSnapshot,
   route: "image" | "video",
-  onProgress?: GenerationMonitorOptions["onProgress"]
+  onProgress?: GenerationMonitorOptions["onProgress"],
+  shouldCancel?: () => boolean,
+  onImageDetected?: (snapshot: GenerationSnapshot, urls: string[]) => void
 ) {
-  const deadline = Date.now() + 8 * 60_000;
   const startedAt = Date.now();
   let expectedMinutes = 0;
   let lastProgressMinute = -1;
   let lastExpectedMinutes = -1;
   let overdueReported = false;
   const beforeImages = new Set(baseline.imageUrls);
-  while (route === "video" || Date.now() < deadline) {
+  while (true) {
+    if (shouldCancel?.()) throw new Error("已取消重新生图");
     if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
     const current = await readGenerationSnapshot(win, route);
     const failure = generationFailure(current.bodyText);
     if (failure && route === "image") throw new Error(failure);
-    const imageUrls = current.imageUrls.filter((url) => !beforeImages.has(url));
-    if (route === "image" && imageUrls.length && /已生成图片|生成的图片|图片已生成/.test(current.bodyText)) {
+    const imageUrls = newGeneratedImageUrls(beforeImages, current.imageCandidates);
+    if (route === "image" && imageUrls.length && (imageReplyText(current.bodyText) || current.imageCandidates.some((candidate) => imageReplyText(candidate.contextText)))) {
       await delay(2_000);
       const stable = await readGenerationSnapshot(win, route);
-      const stableUrls = stable.imageUrls.filter((url) => !beforeImages.has(url));
-      if (stableUrls.length) return { ...stable, imageUrls: stableUrls };
+      const stableUrls = newGeneratedImageUrls(beforeImages, stable.imageCandidates);
+      if (stableUrls.length) {
+        onImageDetected?.(stable, stableUrls);
+        return { ...stable, imageUrls: stableUrls };
+      }
     }
     if (route === "video" && current.videoCardCount > baseline.videoCardCount && /视频生成好了|视频已生成/.test(current.bodyText)) {
       return current;
@@ -1240,10 +1294,23 @@ async function waitForGenerationCompletion(
         onProgress?.("waiting", "可能仍在生成，请去豆包查看 · 工作台继续监听");
         overdueReported = true;
       }
+    } else {
+      const elapsedMinutes = Math.floor((Date.now() - startedAt) / 60_000);
+      if (elapsedMinutes >= 8 && !overdueReported) {
+        onProgress?.("waiting", "已超过 8 分钟，仍在监听豆包出图");
+        overdueReported = true;
+      }
     }
     await delay(route === "image" ? 1_500 : 3_000);
   }
-  throw new Error("等待分镜图生成完成超时");
+}
+
+function imageRoleCounts(candidates: DoubaoImageCandidateSnapshot[]) {
+  return candidates.reduce<Record<string, number>>((counts, candidate) => {
+    counts[candidate.role] = (counts[candidate.role] || 0) + 1;
+    if (candidate.inComposer) counts.composer = (counts.composer || 0) + 1;
+    return counts;
+  }, {});
 }
 
 function generationFailure(bodyText: string) {

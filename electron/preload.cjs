@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld("desktopApi", {
     chooseSourceImage: () => ipcRenderer.invoke("tasks:choose-source-image"),
     openImage: (id) => ipcRenderer.invoke("tasks:open-image", id),
     chooseImage: (id) => ipcRenderer.invoke("tasks:choose-image", id),
+    importImageCandidate: (id) => ipcRenderer.invoke("tasks:import-image-candidate", id),
+    cancelImageRegeneration: (id) => ipcRenderer.invoke("tasks:cancel-image-regeneration", id),
     updateImageStatus: (id, status) => ipcRenderer.invoke("tasks:update-image-status", id, status),
     approveImageCandidate: (id) => ipcRenderer.invoke("tasks:approve-image-candidate", id),
     reviewVideoCandidate: (id, approved) => ipcRenderer.invoke("tasks:review-video-candidate", id, approved),

@@ -205,6 +205,8 @@ export interface DesktopApi {
     chooseSourceImage(): Promise<{ path: string; name: string; aspectRatio: string } | null>;
     openImage(id: string): Promise<TaskRecord>;
     chooseImage(id: string): Promise<TaskRecord | null>;
+    importImageCandidate(id: string): Promise<TaskRecord | null>;
+    cancelImageRegeneration(id: string): Promise<TaskRecord>;
     updateImageStatus(id: string, status: ImageTaskStatus): Promise<TaskRecord>;
     approveImageCandidate(id: string): Promise<TaskRecord>;
     reviewVideoCandidate(id: string, approved: boolean): Promise<TaskRecord>;

@@ -515,6 +515,20 @@ async function chooseTaskImage(task: TaskRecord) {
   });
 }
 
+async function importImageCandidate(task: TaskRecord) {
+  await act(async () => {
+    const imported = await window.desktopApi.tasks.importImageCandidate(task.id);
+    if (imported) flash("分镜图已导入候选列表，审核通过后才会替换当前锁定首帧");
+  });
+}
+
+async function cancelImageRegeneration(task: TaskRecord) {
+  await act(async () => {
+    await window.desktopApi.tasks.cancelImageRegeneration(task.id);
+    flash("已取消重新生图，继续使用原来锁定的首帧");
+  });
+}
+
 async function updateImageTask(task: TaskRecord, status: ImageTaskStatus) {
   await act(async () => {
     await window.desktopApi.tasks.updateImageStatus(task.id, status);
@@ -865,6 +879,15 @@ function videoStageLocked(task: TaskRecord) {
   return task.firstFrameSource !== "none" && task.imageStatus !== "approved";
 }
 
+function canCancelImageRegeneration(task: TaskRecord) {
+  return task.firstFrameSource === "generated" && Boolean(task.imagePath) && (
+    task.imagePrepareState === "running" ||
+    task.imagePrepareState === "failed" ||
+    (task.imagePrepareState === "ready" && /(?:等待你在豆包点击生成|自动点击生成)/.test(task.imagePrepareStep)) ||
+    task.imageStatus !== "approved"
+  );
+}
+
 function importReferenceFile(name: string) {
   return importCharacterReferenceResolution.value?.files.find((file) => file.name.toLowerCase() === fileName(name).toLowerCase()) ?? null;
 }
@@ -1102,7 +1125,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                       <span>模型：{{ task.model }}（{{ parameterSourceLabel(task.modelSource) }}）</span>
                       <span>时长：{{ durationLabel(task.duration) }}（{{ parameterSourceLabel(task.durationSource) }}）</span>
                       <span>画幅：{{ aspectRatioLabel(task.aspectRatio) }}（{{ parameterSourceLabel(task.aspectRatioSource) }}）</span>
-                      <span>计划候选：{{ task.generationCount }} 次</span>
+                      <span>期望候选：{{ task.generationCount }} 张（仅作计划，不会自动连跑）</span>
                       <span>实际轮次：生图 {{ task.imageGenerationCount }} · 视频 {{ task.videoGenerationCount }}</span>
                     </div>
                     <p v-if="task.imagePath" class="image-path" :title="task.imagePath">已关联：{{ task.firstFrameFileName || fileName(task.imagePath) }}</p>
@@ -1149,7 +1172,9 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                       <button v-if="task.firstFrameSource === 'generated'" class="primary small" @click="openImageTask(task)">打开生图页</button>
                       <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记生图已提交</button>
                       <button v-if="task.firstFrameSource === 'generated' && task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
-                      <button @click="chooseTaskImage(task)">{{ task.firstFrameSource === 'local' ? '选择本地首帧' : '选择生成结果' }}</button>
+                      <button v-if="task.firstFrameSource === 'local'" @click="chooseTaskImage(task)">选择本地首帧</button>
+                      <button v-else @click="importImageCandidate(task)">导入分镜图候选</button>
+                      <button v-if="canCancelImageRegeneration(task)" @click="cancelImageRegeneration(task)">取消重新生图</button>
                       <button v-if="task.firstFrameSource === 'generated' && task.imageStatus !== 'failed'" @click="updateImageTask(task, 'failed')">生图失败</button>
                     </div>
                     <div class="card-actions stage-actions">
@@ -1223,7 +1248,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
           <label>分镜视频提示词<textarea v-model="taskForm.prompt" rows="5" placeholder="描述镜头运动、主体动作、节奏、声音和禁止项…" required></textarea></label>
           <label>口播 / 旁白（选填，不参与提示词）<textarea v-model="taskForm.narration" rows="2" placeholder="后续可用于字幕或配音稿"></textarea></label>
           <label>备注（选填，不参与提示词）<textarea v-model="taskForm.notes" rows="2"></textarea></label>
-          <label>计划生成次数（候选数量）<input v-model.number="taskForm.generationCount" type="number" min="1" max="20" step="1" /></label>
+          <label>期望候选数量（仅作计划，不会自动连跑）<input v-model.number="taskForm.generationCount" type="number" min="1" max="20" step="1" /></label>
         </div>
 
         <div class="form-row">

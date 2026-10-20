@@ -427,6 +427,41 @@ export class StudioDatabase {
     return this.getTask(taskId);
   }
 
+  importImageCandidate(taskId: string, sourcePath: string) {
+    const task = this.getTask(taskId);
+    if (task.firstFrameSource !== "generated") throw new Error("只有提示词生成的首帧才能导入分镜图候选");
+    if (!existsSync(sourcePath)) throw new Error("选择的图片文件不存在");
+    const extension = path.extname(sourcePath).toLowerCase();
+    if (![".png", ".jpg", ".jpeg", ".webp"].includes(extension)) throw new Error("仅支持 PNG、JPG、JPEG 或 WebP 图片");
+    const target = this.generationTarget(taskId, "image", "");
+    const filePath = uniqueTargetPath(path.join(target.folder, `${target.baseName}_候选1${extension}`));
+    if (path.normalize(path.resolve(sourcePath)) !== path.normalize(path.resolve(filePath))) copyFileSync(sourcePath, filePath);
+    this.addTaskCandidates(taskId, "image", target.generationIndex, [{ sourceUrl: "manual-import", filePath, hasWatermark: false }]);
+    this.db.prepare(`
+      UPDATE tasks SET image_status = 'ready',
+        image_prepare_state = 'ready', image_prepare_step = '已导入分镜图候选',
+        image_prepare_message = '已锁定的首帧仍保留；审核通过新候选后才会替换。', updated_at = ?
+      WHERE id = ?
+    `).run(now(), taskId);
+    return this.getTask(taskId);
+  }
+
+  restoreLockedImageState(taskId: string, step = "继续使用已锁定首帧") {
+    const task = this.getTask(taskId);
+    const status: ImageTaskStatus = task.imagePath
+      ? "approved"
+      : task.imageCandidates.some((candidate) => candidate.reviewStatus === "pending")
+        ? "ready"
+        : task.firstFrameSource === "none"
+          ? "skipped"
+          : "pending";
+    this.db.prepare(`
+      UPDATE tasks SET image_status = ?, image_prepare_state = 'ready', image_prepare_step = ?,
+        image_prepare_message = NULL, updated_at = ? WHERE id = ?
+    `).run(status, step, now(), taskId);
+    return this.getTask(taskId);
+  }
+
   private getCandidate(id: string): MediaCandidate {
     const row = this.db.prepare("SELECT * FROM media_candidates WHERE id = ?").get(id) as DbRow | undefined;
     if (!row) throw new Error("候选素材不存在");
