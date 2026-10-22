@@ -239,6 +239,8 @@ export interface DesktopApi {
     stats(): Promise<RuntimeStats>;
     chooseDataDirectory(): Promise<DataDirectoryChangeResult>;
     exportDiagnostics(): Promise<DiagnosticsExportResult>;
+    openRepository(): Promise<void>;
+    openDataDirectory(): Promise<void>;
   };
   onDataChanged(callback: () => void): () => void;
 }

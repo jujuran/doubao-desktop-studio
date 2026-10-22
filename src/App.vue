@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import type {
   Account,
   AccountUsage,
@@ -34,7 +34,7 @@ const tasks = ref<TaskRecord[]>([]);
 const usage = ref<AccountUsage[]>([]);
 const projectStyles = ref<ProjectStyleProfile[]>([]);
 const settings = ref<AppSettings>({
-  maxActiveWorkers: 2,
+  maxActiveWorkers: 3,
   automationEnabled: false,
   autoClickGenerate: false,
   lastTaskAccountId: null,
@@ -55,6 +55,8 @@ const runtime = ref<RuntimeStats>({
 const loading = ref(true);
 const notice = ref("");
 const noticeError = ref(false);
+const aboutCard = ref<HTMLElement | null>(null);
+const settingsSaveState = ref<"saved" | "saving" | "error">("saved");
 const newAccountLabel = ref("");
 const showAccountDialog = ref(false);
 const renameAccountTarget = ref<Account | null>(null);
@@ -107,6 +109,11 @@ const taskForm = reactive({
 const readyAccounts = computed(() => accounts.value.filter((account) => account.status === "ready"));
 const queuedTasks = computed(() => tasks.value.filter((task) => task.status === "queued").length);
 const activeTasks = computed(() => tasks.value.filter((task) => task.status === "running").length);
+const settingsSaveLabel = computed(() => ({
+  saved: "✓ 修改后自动保存",
+  saving: "正在保存…",
+  error: "保存失败，请重试"
+})[settingsSaveState.value]);
 const accountById = computed(() => new Map(accounts.value.map((account) => [account.id, account])));
 const usageByAccount = computed(() => new Map(usage.value.map((item) => [item.accountId, item])));
 const projectStyleByName = computed(() => new Map(projectStyles.value.map((profile) => [profile.projectName, profile])));
@@ -212,6 +219,7 @@ const taskGroups = computed(() => {
 let removeChangeListener: (() => void) | undefined;
 let statsTimer: number | undefined;
 let taskDefaultsLoaded = false;
+let settingsSaveRevision = 0;
 
 onMounted(async () => {
   await refresh();
@@ -772,14 +780,34 @@ async function updateTask(task: TaskRecord, status: TaskStatus) {
   });
 }
 
-async function saveSettings() {
-  await act(async () => {
-    settings.value = await window.desktopApi.settings.update({
-      maxActiveWorkers: settings.value.maxActiveWorkers,
-      autoClickGenerate: settings.value.autoClickGenerate
-    });
-    flash("设置已保存");
-  });
+async function persistSettings(input: Partial<AppSettings>) {
+  const revision = ++settingsSaveRevision;
+  settingsSaveState.value = "saving";
+  try {
+    const saved = await window.desktopApi.settings.update(input);
+    if (revision !== settingsSaveRevision) return;
+    if (input.maxActiveWorkers !== undefined) settings.value.maxActiveWorkers = saved.maxActiveWorkers;
+    if (input.autoClickGenerate !== undefined) settings.value.autoClickGenerate = saved.autoClickGenerate;
+    settingsSaveState.value = "saved";
+  } catch (error) {
+    if (revision !== settingsSaveRevision) return;
+    settingsSaveState.value = "error";
+    await refreshData();
+    flash(formatError(error), true);
+  }
+}
+
+function adjustMaxActiveWindows(delta: number) {
+  const next = Math.min(20, Math.max(1, settings.value.maxActiveWorkers + delta));
+  if (next === settings.value.maxActiveWorkers) return;
+  settings.value.maxActiveWorkers = next;
+  void persistSettings({ maxActiveWorkers: next });
+}
+
+function toggleAutoClickGenerate() {
+  const next = !settings.value.autoClickGenerate;
+  settings.value.autoClickGenerate = next;
+  void persistSettings({ autoClickGenerate: next });
 }
 
 async function chooseDataDirectory() {
@@ -795,6 +823,28 @@ async function exportDiagnostics() {
     const result = await window.desktopApi.runtime.exportDiagnostics();
     flash(result.message);
   });
+}
+
+async function openDataDirectory() {
+  try {
+    await window.desktopApi.runtime.openDataDirectory();
+  } catch (error) {
+    flash(formatError(error), true);
+  }
+}
+
+async function openAbout() {
+  activeTab.value = "settings";
+  await nextTick();
+  aboutCard.value?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function openRepository() {
+  try {
+    await window.desktopApi.runtime.openRepository();
+  } catch (error) {
+    flash(formatError(error), true);
+  }
 }
 
 async function act(operation: () => Promise<void>) {
@@ -1010,6 +1060,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
         <strong>{{ runtime.totalPrivateMb }} MB</strong>
         <small>{{ runtime.activeAccountWindows }} 个账号窗口 · {{ runtime.processCount }} 个进程</small>
       </div>
+      <button class="sidebar-credit" type="button" @click="openAbout">by jujuran · 免费开源</button>
     </aside>
 
     <main>
@@ -1018,7 +1069,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
           <p class="eyebrow">LOCAL FIRST · SESSION ISOLATION</p>
           <h1>{{ { overview: '工作台概览', accounts: '账号空间', tasks: '视频任务', settings: '运行设置' }[activeTab] }}</h1>
         </div>
-        <button class="primary" @click="openAddAccount">＋ 添加账号</button>
+        <button v-if="activeTab !== 'settings'" class="primary" @click="openAddAccount">＋ 添加账号</button>
       </header>
 
       <div v-if="notice" class="toast" :class="{ error: noticeError }">{{ notice }}</div>
@@ -1199,11 +1250,69 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
       </template>
 
       <template v-else>
-        <section class="settings-grid">
-          <article class="panel setting-card"><p class="eyebrow">CONCURRENCY</p><h2>活动 Worker 上限</h2><p class="muted">账号可以有 20 个，但豆包窗口默认最多同时保留 2 个。</p><div class="stepper"><button @click="settings.maxActiveWorkers = Math.max(1, settings.maxActiveWorkers - 1)">−</button><strong>{{ settings.maxActiveWorkers }}</strong><button @click="settings.maxActiveWorkers = Math.min(3, settings.maxActiveWorkers + 1)">＋</button></div><button class="primary" @click="saveSettings">保存设置</button></article>
-          <article class="panel setting-card"><p class="eyebrow">LOCAL DATA</p><h2>数据目录</h2><p class="muted">账号会话、SQLite 数据库和缓存仅保存在本机。</p><code class="path">{{ runtime.dataPath }}</code><p v-if="runtime.dataPathNotice" class="migration-warning">{{ runtime.dataPathNotice }}</p><button @click="chooseDataDirectory">更改目录</button><p class="security-note">迁移时保留原目录作为备份；不保存密码、短信验证码或 2FA 密钥。</p></article>
-          <article class="panel setting-card"><p class="eyebrow">AUTOMATION</p><h2>自动点击生成</h2><p class="muted">默认关闭。开启后仅在提示词、模型、比例、时长及首帧缩略图全部回读一致时点击；不一致会停止并常驻报错。</p><label class="checkbox-row"><input v-model="settings.autoClickGenerate" type="checkbox" />准备完成后自动点击生成</label><button class="primary" @click="saveSettings">保存设置</button></article>
-          <article class="panel setting-card"><p class="eyebrow">DIAGNOSTICS</p><h2>诊断信息</h2><p class="muted">版本 v{{ runtime.version }}。日志只记录程序事件和错误，不记录 Cookie、密码或验证码。</p><code class="path">{{ runtime.logPath }}</code><button @click="exportDiagnostics">导出诊断信息</button><p class="security-note">发送诊断文件前仍建议自行检查内容。</p></article>
+        <section class="settings-page">
+          <div class="settings-grid">
+            <article class="panel setting-card settings-main-card">
+              <h2>生成</h2>
+              <div class="setting-control-row">
+                <div>
+                  <h3>同时打开的豆包窗口</h3>
+                  <p class="muted">推荐 3 个，可设置 1–20 个（最大 20 个）。数量越多，能同时生成的分镜越多，但越占内存。账号数量不受这里限制。</p>
+                </div>
+                <div class="stepper compact-stepper" aria-label="同时打开的豆包窗口数量">
+                  <button :disabled="settings.maxActiveWorkers <= 1" @click="adjustMaxActiveWindows(-1)">−</button>
+                  <strong>{{ settings.maxActiveWorkers }}</strong>
+                  <button :disabled="settings.maxActiveWorkers >= 20" @click="adjustMaxActiveWindows(1)">＋</button>
+                </div>
+              </div>
+              <div class="setting-divider"></div>
+              <div class="setting-control-row">
+                <div>
+                  <h3>准备完成后自动点击生成</h3>
+                  <p class="muted">提示词、模型、比例、时长、首帧全部核对一致才点击，不一致就停下并报错。</p>
+                </div>
+                <button class="switch" :class="{ on: settings.autoClickGenerate }" type="button" role="switch" :aria-checked="settings.autoClickGenerate" @click="toggleAutoClickGenerate">
+                  <span></span>
+                </button>
+              </div>
+              <p class="auto-save-note" :class="settingsSaveState">{{ settingsSaveLabel }}</p>
+            </article>
+
+            <article class="panel setting-card settings-main-card data-diagnostics-card">
+              <h2>数据与诊断</h2>
+              <div class="path-setting-row">
+                <div><h3>数据目录</h3><p class="muted">账号会话、数据库和缓存仅保存在本机。</p></div>
+                <code class="path single-line" :title="runtime.dataPath">{{ runtime.dataPath }}</code>
+              </div>
+              <p v-if="runtime.dataPathNotice" class="migration-warning">{{ runtime.dataPathNotice }}</p>
+              <div class="setting-divider"></div>
+              <div class="path-setting-row">
+                <div><h3>诊断日志</h3><p class="muted">只记录程序事件和错误，不记录 Cookie、密码或验证码。</p></div>
+                <code class="path single-line" :title="runtime.logPath">{{ runtime.logPath }}</code>
+              </div>
+              <div class="settings-actions">
+                <button @click="chooseDataDirectory">更改目录</button>
+                <button @click="openDataDirectory">打开文件夹</button>
+                <button @click="exportDiagnostics">导出诊断信息</button>
+              </div>
+            </article>
+          </div>
+
+          <article ref="aboutCard" class="panel setting-card about-card">
+            <div>
+              <h2>关于 Doubao Desktop Studio</h2>
+              <dl class="about-details">
+                <div><dt>版本</dt><dd>v{{ runtime.version }}</dd></div>
+                <div><dt>作者</dt><dd>jujuran</dd></div>
+                <div><dt>许可证</dt><dd>MIT License</dd></div>
+              </dl>
+              <button class="repository-link" type="button" @click="openRepository">GitHub：jujuran/doubao-desktop-studio ↗</button>
+            </div>
+            <div class="free-warning">
+              <strong>本软件免费开源</strong>
+              <p>本软件在 GitHub 免费提供，无需付费购买。如果你是花钱买到的，可以到 GitHub 免费下载最新版。</p>
+            </div>
+          </article>
         </section>
       </template>
     </main>

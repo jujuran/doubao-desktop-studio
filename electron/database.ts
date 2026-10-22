@@ -227,7 +227,7 @@ export class StudioDatabase {
         AND character_reference_paths_json = '[]'
     `);
     this.createLegacyStyleDrafts();
-    this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("maxActiveWorkers", "2");
+    this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("maxActiveWorkers", "3");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("automationEnabled", "false");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("autoClickGenerate", "false");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("lastTaskAccountId", "");
@@ -840,7 +840,7 @@ export class StudioDatabase {
     const rows = this.db.prepare("SELECT key, value FROM settings").all() as DbRow[];
     const values = Object.fromEntries(rows.map((row) => [String(row.key), String(row.value)]));
     return {
-      maxActiveWorkers: clampWorkers(Number(values.maxActiveWorkers || 2)),
+      maxActiveWorkers: clampWorkers(Number(values.maxActiveWorkers || 3)),
       automationEnabled: values.automationEnabled === "true",
       autoClickGenerate: values.autoClickGenerate === "true",
       lastTaskAccountId: values.lastTaskAccountId || null,
@@ -994,7 +994,7 @@ function localUsageDate() {
 }
 
 function clampWorkers(value: number) {
-  return Math.min(3, Math.max(1, Math.round(Number.isFinite(value) ? value : 2)));
+  return Math.min(20, Math.max(1, Math.round(Number.isFinite(value) ? value : 3)));
 }
 
 function normalizeFirstFrameSource(

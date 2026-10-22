@@ -45,11 +45,25 @@ describe("StudioDatabase", () => {
     db.close();
   });
 
-  it("clamps worker concurrency to a memory-safe range", () => {
+  it("allows worker concurrency up to the configurable maximum", () => {
     const db = createDatabase();
-    expect(db.updateSettings({ maxActiveWorkers: 20 }).maxActiveWorkers).toBe(3);
+    expect(db.getSettings().maxActiveWorkers).toBe(3);
+    expect(db.updateSettings({ maxActiveWorkers: 20 }).maxActiveWorkers).toBe(20);
+    expect(db.updateSettings({ maxActiveWorkers: 21 }).maxActiveWorkers).toBe(20);
     expect(db.updateSettings({ maxActiveWorkers: 0 }).maxActiveWorkers).toBe(1);
     db.close();
+  });
+
+  it("persists automatically saved generation settings across restart", () => {
+    const db = createDatabase();
+    const dir = tempDirs[tempDirs.length - 1];
+    db.updateSettings({ maxActiveWorkers: 3, autoClickGenerate: true });
+    db.close();
+
+    const reopened = new StudioDatabase(dir);
+    expect(reopened.getSettings().maxActiveWorkers).toBe(3);
+    expect(reopened.getSettings().autoClickGenerate).toBe(true);
+    reopened.close();
   });
 
   it("creates, edits, duplicates and removes storyboard tasks", () => {

@@ -1,8 +1,14 @@
 {
   "name": "doubao-desktop-studio",
-  "version": "0.1.25",
+  "version": "0.1.28",
   "private": true,
   "author": "jujuran",
+  "license": "MIT",
+  "homepage": "https://github.com/jujuran/doubao-desktop-studio",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jujuran/doubao-desktop-studio.git"
+  },
   "description": "Cross-platform, local-first workspace for isolated Doubao account sessions.",
   "engines": {
     "node": ">=24"
@@ -44,6 +50,7 @@
   "build": {
     "appId": "com.local.doubao.desktopstudio",
     "productName": "Doubao Desktop Studio",
+    "copyright": "Copyright © 2026 jujuran",
     "asar": true,
     "directories": {
       "output": "release/current"
@@ -52,6 +59,8 @@
       "dist/**/*",
       "dist-electron/**/*",
       "electron/preload.cjs",
+      "LICENSE",
+      "NOTICE",
       "package.json"
     ],
     "win": {

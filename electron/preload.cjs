@@ -54,7 +54,9 @@ contextBridge.exposeInMainWorld("desktopApi", {
   runtime: {
     stats: () => ipcRenderer.invoke("runtime:stats"),
     chooseDataDirectory: () => ipcRenderer.invoke("runtime:choose-data-directory"),
-    exportDiagnostics: () => ipcRenderer.invoke("runtime:export-diagnostics")
+    exportDiagnostics: () => ipcRenderer.invoke("runtime:export-diagnostics"),
+    openRepository: () => ipcRenderer.invoke("runtime:open-repository"),
+    openDataDirectory: () => ipcRenderer.invoke("runtime:open-data-directory")
   },
   onDataChanged: (callback) => {
     const listener = () => callback();

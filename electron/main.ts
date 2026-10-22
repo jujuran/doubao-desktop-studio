@@ -33,6 +33,7 @@ interface GenerationMonitorToken {
 }
 
 const activeGenerationMonitors = new Map<string, GenerationMonitorToken>();
+const REPOSITORY_URL = "https://github.com/jujuran/doubao-desktop-studio";
 const activeImagePreparations = new Map<string, GenerationMonitorToken>();
 
 function createMainWindow() {
@@ -67,6 +68,7 @@ function notifyChanged() {
 function registerIpc() {
   ipcMain.handle("accounts:list", () => database.listAccounts());
   ipcMain.handle("accounts:create", (_event, label: string) => {
+    sessions.assertCanOpenAccountWindow();
     const account = database.createAccount(label);
     diagnostics.info("account_created", { accountId: shortAccountId(account.id) });
     sessions.open(account);
@@ -409,6 +411,7 @@ function registerIpc() {
   ipcMain.handle("settings:get", () => database.getSettings());
   ipcMain.handle("settings:update", (_event, input: Partial<AppSettings>) => {
     const settings = database.updateSettings(input);
+    sessions.setMaxActiveWindows(settings.maxActiveWorkers);
     notifyChanged();
     return settings;
   });
@@ -425,6 +428,11 @@ function registerIpc() {
       logPath: diagnostics.logPath,
       dataPathNotice: dataLocation.notice
     };
+  });
+  ipcMain.handle("runtime:open-repository", () => shell.openExternal(REPOSITORY_URL));
+  ipcMain.handle("runtime:open-data-directory", async () => {
+    const message = await shell.openPath(app.getPath("userData"));
+    if (message) throw new Error(`打开数据目录失败：${message}`);
   });
   ipcMain.handle("runtime:choose-data-directory", async (event) => {
     const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
@@ -657,6 +665,7 @@ app.whenReady().then(() => {
     },
     onDiagnostic: (level, event, details) => logDiagnostic(level, event, details)
   });
+  sessions.setMaxActiveWindows(database.getSettings().maxActiveWorkers);
   diagnostics.info("application_started", {
     version: app.getVersion(),
     platform: process.platform,

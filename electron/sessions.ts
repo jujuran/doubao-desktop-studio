@@ -75,6 +75,7 @@ export interface DownloadedGenerationCandidate {
 export class AccountSessionManager {
   private readonly windows = new Map<string, BrowserWindow>();
   private readonly monitors = new Map<string, MonitorState>();
+  private maxActiveWindows = 3;
 
   constructor(private readonly events: AccountSessionEvents) {}
 
@@ -84,6 +85,17 @@ export class AccountSessionManager {
 
   get activeAccountIds() {
     return [...this.windows.keys()];
+  }
+
+  setMaxActiveWindows(value: number) {
+    this.maxActiveWindows = Math.min(20, Math.max(1, Math.round(value)));
+  }
+
+  assertCanOpenAccountWindow(accountId?: string) {
+    if (accountId && this.windows.has(accountId)) return;
+    if (this.windows.size >= this.maxActiveWindows) {
+      throw new Error(`同时打开的豆包窗口已达到上限（${this.maxActiveWindows} 个）。请先关闭一个账号窗口，或在设置中调高上限（最多 20 个）`);
+    }
   }
 
   open(account: Account, route: "home" | "chat" | "image" | "video" = "home", visible = true) {
@@ -97,6 +109,8 @@ export class AccountSessionManager {
       this.scheduleMonitor(account, existing, 250);
       return existing;
     }
+
+    this.assertCanOpenAccountWindow(account.id);
 
     const accountSession = session.fromPartition(account.partition, { cache: true });
     accountSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
@@ -274,13 +288,30 @@ export class AccountSessionManager {
       }
       return results;
     }
-    return [await downloadOfficialOriginal(win, options.outputFolder, options.baseName)];
+    return [await downloadOfficialOriginal(
+      win,
+      options.outputFolder,
+      options.baseName,
+      (level, event, details) => this.events.onDiagnostic(level, event, {
+        accountId: shortAccountId(account.id),
+        ...details
+      })
+    )];
   }
 
   async downloadLatestVideo(account: Account, outputFolder: string, baseName: string) {
     const win = this.windows.get(account.id);
     if (!win || win.isDestroyed()) throw new Error("请先打开账号对应的豆包对话，再重新检查下载");
-    return downloadOfficialOriginal(win, outputFolder, baseName);
+    return downloadOfficialOriginal(
+      win,
+      outputFolder,
+      baseName,
+      (level, event, details) => this.events.onDiagnostic(level, event, {
+        accountId: shortAccountId(account.id),
+        trigger: "manual_recheck",
+        ...details
+      })
+    );
   }
 
   async verify(account: Account) {
@@ -1354,6 +1385,21 @@ async function pauseAndMuteVideos(win: BrowserWindow) {
   `, true);
 }
 
+async function revealLatestVideoControls(win: BrowserWindow) {
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const videos = Array.from(document.querySelectorAll('video')).map(video => {
+        const rect = video.getBoundingClientRect();
+        const style = getComputedStyle(video);
+        return { rect, visible: rect.width > 120 && rect.height > 80 && style.display !== 'none' && style.visibility !== 'hidden' };
+      }).filter(item => item.visible).sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+      const video = videos[0]?.rect;
+      return video ? { x: Math.round(video.left + video.width / 2), y: Math.round(video.top + Math.min(video.height / 2, 120)) } : null;
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (point) win.webContents.sendInputEvent({ type: "mouseMove", x: point.x, y: point.y });
+}
+
 async function clickOfficialDownloadControl(win: BrowserWindow, onStarted: () => boolean) {
   const labelledPoint = await win.webContents.executeJavaScript(`
     (() => {
@@ -1414,27 +1460,72 @@ async function clickOfficialDownloadControl(win: BrowserWindow, onStarted: () =>
   return false;
 }
 
-async function downloadOfficialOriginal(win: BrowserWindow, outputFolder: string, baseName: string): Promise<DownloadedGenerationCandidate> {
+type DownloadDiagnostic = (
+  level: "info" | "warn" | "error",
+  event: string,
+  details?: Record<string, unknown>
+) => void;
+
+async function downloadOfficialOriginal(
+  win: BrowserWindow,
+  outputFolder: string,
+  baseName: string,
+  onDiagnostic?: DownloadDiagnostic
+): Promise<DownloadedGenerationCandidate> {
   mkdirSync(outputFolder, { recursive: true });
   const finalPath = uniqueDownloadPath(path.join(outputFolder, `${baseName}.mp4`));
-  await openLatestVideoPreview(win);
-  const first = await runOfficialDownloadAttempt(win, `${finalPath}.attempt1.mp4`);
-  let selected = first;
-  if (videoSourceHasWatermark(first.sourceUrl)) {
-    const second = await runOfficialDownloadAttempt(win, `${finalPath}.attempt2.mp4`);
-    if (!videoSourceHasWatermark(second.sourceUrl)) selected = second;
-    else selected = second;
+  try {
+    await openLatestVideoPreview(win);
+    await pauseAndMuteVideos(win);
+    const first = await runOfficialDownloadWithRetry(win, `${finalPath}.attempt1.mp4`, "primary", onDiagnostic);
+    let selected = first;
+    if (videoSourceHasWatermark(first.sourceUrl)) {
+      const second = await runOfficialDownloadWithRetry(win, `${finalPath}.attempt2.mp4`, "unwatermarked_retry", onDiagnostic);
+      if (!videoSourceHasWatermark(second.sourceUrl)) selected = second;
+      else selected = second;
+    }
+    for (const attempt of [first, selected]) {
+      if (attempt.filePath !== selected.filePath && existsSync(attempt.filePath)) unlinkSync(attempt.filePath);
+    }
+    if (!existsSync(selected.filePath) || statSync(selected.filePath).size <= 0) throw new Error("官方下载完成但文件校验失败，下载页已保留");
+    renameSync(selected.filePath, finalPath);
+    await pauseAndMuteVideos(win);
+    win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+    win.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+    await delay(250);
+    return { sourceUrl: selected.sourceUrl, filePath: finalPath, hasWatermark: videoSourceHasWatermark(selected.sourceUrl) };
+  } catch (error) {
+    await pauseAndMuteVideos(win).catch(() => undefined);
+    onDiagnostic?.("error", "video_download_failed_after_retries", { message: errorMessage(error) });
+    throw error;
   }
-  for (const attempt of [first, selected]) {
-    if (attempt.filePath !== selected.filePath && existsSync(attempt.filePath)) unlinkSync(attempt.filePath);
+}
+
+async function runOfficialDownloadWithRetry(
+  win: BrowserWindow,
+  savePath: string,
+  phase: "primary" | "unwatermarked_retry",
+  onDiagnostic?: DownloadDiagnostic
+) {
+  const waits = [1_200, 2_500, 4_000];
+  let lastError: unknown = new Error("没有识别到豆包视频下载入口");
+  for (let index = 0; index < waits.length; index += 1) {
+    const attempt = index + 1;
+    onDiagnostic?.("info", "video_download_attempt_started", { phase, attempt, maxAttempts: waits.length, waitMilliseconds: waits[index] });
+    await pauseAndMuteVideos(win);
+    await revealLatestVideoControls(win);
+    await delay(waits[index]);
+    try {
+      const result = await runOfficialDownloadAttempt(win, savePath);
+      onDiagnostic?.("info", "video_download_attempt_succeeded", { phase, attempt });
+      return result;
+    } catch (error) {
+      lastError = error;
+      onDiagnostic?.("warn", "video_download_attempt_failed", { phase, attempt, message: errorMessage(error) });
+      await pauseAndMuteVideos(win).catch(() => undefined);
+    }
   }
-  if (!existsSync(selected.filePath) || statSync(selected.filePath).size <= 0) throw new Error("官方下载完成但文件校验失败，下载页已保留");
-  renameSync(selected.filePath, finalPath);
-  await pauseAndMuteVideos(win);
-  win.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
-  win.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
-  await delay(250);
-  return { sourceUrl: selected.sourceUrl, filePath: finalPath, hasWatermark: videoSourceHasWatermark(selected.sourceUrl) };
+  throw new Error(`自动等待并重试 ${waits.length} 次后仍未完成官方下载：${errorMessage(lastError)}`);
 }
 
 async function runOfficialDownloadAttempt(win: BrowserWindow, savePath: string) {
