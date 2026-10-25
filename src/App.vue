@@ -7,6 +7,8 @@ import type {
   AppSettings,
   ImageTaskStatus,
   ProjectReferenceKind,
+  ProjectRecord,
+  ProjectStatus,
   ProjectStyleInput,
   ProjectStyleProfile,
   RuntimeStats,
@@ -26,13 +28,15 @@ import {
   VIDEO_MODEL_OPTIONS
 } from "./video-options";
 
-type Tab = "overview" | "accounts" | "tasks" | "settings";
+type Tab = "overview" | "accounts" | "tasks" | "projects" | "settings";
 
 const activeTab = ref<Tab>("overview");
 const accounts = ref<Account[]>([]);
 const tasks = ref<TaskRecord[]>([]);
 const usage = ref<AccountUsage[]>([]);
 const projectStyles = ref<ProjectStyleProfile[]>([]);
+const projects = ref<ProjectRecord[]>([]);
+const selectedProjectName = ref("");
 const settings = ref<AppSettings>({
   maxActiveWorkers: 3,
   automationEnabled: false,
@@ -203,7 +207,7 @@ const availableDurations = computed(() => durationOptions(selectedVideoModel.val
 const availableAspectRatios = computed(() => selectedVideoModel.value.aspectRatios);
 const taskGroups = computed(() => {
   const groups = new Map<string, TaskRecord[]>();
-  for (const task of tasks.value) {
+  for (const task of tasks.value.filter((item) => item.projectName === selectedProjectName.value)) {
     const projectName = task.projectName;
     const group = groups.get(projectName) ?? [];
     group.push(task);
@@ -215,6 +219,8 @@ const taskGroups = computed(() => {
     tasks: groupTasks.sort((left, right) => left.shotNumber - right.shotNumber)
   }));
 });
+const currentProject = computed(() => projects.value.find((project) => project.projectName === selectedProjectName.value) ?? null);
+const currentProjectTasks = computed(() => tasks.value.filter((task) => task.projectName === selectedProjectName.value));
 
 let removeChangeListener: (() => void) | undefined;
 let statsTimer: number | undefined;
@@ -242,18 +248,25 @@ async function refresh() {
 }
 
 async function refreshData() {
-  const [nextAccounts, nextTasks, nextSettings, nextUsage, nextProjectStyles] = await Promise.all([
+  const [nextAccounts, nextTasks, nextSettings, nextUsage, nextProjects, nextProjectStyles] = await Promise.all([
     window.desktopApi.accounts.list(),
     window.desktopApi.tasks.list(),
     window.desktopApi.settings.get(),
     window.desktopApi.usage.listToday(),
+    window.desktopApi.projects.list(),
     window.desktopApi.projects.listStyles()
   ]);
   accounts.value = nextAccounts;
   tasks.value = nextTasks;
   settings.value = nextSettings;
   usage.value = nextUsage;
+  projects.value = nextProjects;
   projectStyles.value = nextProjectStyles;
+  if (!nextProjects.some((project) => project.projectName === selectedProjectName.value && project.status !== "archived")) {
+    selectedProjectName.value = nextProjects.find((project) => project.status === "active")?.projectName
+      ?? nextProjects.find((project) => project.status === "completed")?.projectName
+      ?? "";
+  }
   if (!taskDefaultsLoaded) {
     taskForm.imageAccountId = "";
     taskForm.accountId = "";
@@ -378,6 +391,7 @@ async function saveTask() {
     };
     if (editingTaskId.value) await window.desktopApi.tasks.update(editingTaskId.value, input);
     else await window.desktopApi.tasks.create(input);
+    selectedProjectName.value = input.projectName.trim();
     settings.value = await window.desktopApi.settings.update({
       lastTaskAccountId: input.accountId,
       lastVideoModel: input.model,
@@ -452,7 +466,7 @@ function openNewTask() {
   taskLocalImageName.value = "";
   taskAspectFromFrame.value = false;
   Object.assign(taskParameterTouched, { model: false, duration: false, aspectRatio: false });
-  const currentProject = taskForm.projectName.trim() || tasks.value[0]?.projectName || "";
+  const currentProject = selectedProjectName.value || taskForm.projectName.trim() || tasks.value[0]?.projectName || "";
   taskForm.projectName = currentProject;
   taskForm.shotNumber = Math.max(0, ...tasks.value.filter((task) => task.projectName === currentProject).map((task) => task.shotNumber)) + 1;
   restoreTaskDefaults();
@@ -565,6 +579,13 @@ async function recheckVideoDownload(task: TaskRecord) {
   });
 }
 
+async function retryRejectedGeneration(task: TaskRecord, route: "image" | "video") {
+  await act(async () => {
+    await window.desktopApi.tasks.retryRejected(task.id, route);
+    flash(`已在原豆包对话中重试${route === "image" ? "生图" : "视频"}，不会重新上传参考素材`);
+  });
+}
+
 async function importVideoCandidate(task: TaskRecord) {
   await act(async () => {
     const imported = await window.desktopApi.tasks.importVideoCandidate(task.id);
@@ -583,11 +604,60 @@ async function autoAssignTasks() {
   });
 }
 
+function openNewProject() {
+  importText.value = "";
+  importProjectName.value = "";
+  importAssets.value = { cancelled: false, folderPath: null, files: [] };
+  showImportDialog.value = true;
+}
+
+function uniqueProjectCopyName(name: string) {
+  let index = 2;
+  let candidate = `${name}（副本）`;
+  const names = new Set(projects.value.map((project) => project.projectName));
+  while (names.has(candidate)) candidate = `${name}（副本 ${index++}）`;
+  return candidate;
+}
+
+async function changeProjectStatus(projectName: string, status: ProjectStatus) {
+  await act(async () => {
+    await window.desktopApi.projects.setStatus(projectName, status);
+    if (status === "archived" && selectedProjectName.value === projectName) selectedProjectName.value = "";
+    flash(status === "archived" ? "项目已归档，全部分镜、提示词、候选和文件均已保留" : status === "completed" ? "项目已标记完成" : "项目已恢复到制作中");
+  });
+}
+
+async function continueProject(project: ProjectRecord) {
+  if (project.status !== "active") await window.desktopApi.projects.setStatus(project.projectName, "active");
+  selectedProjectName.value = project.projectName;
+  activeTab.value = "tasks";
+  await refreshData();
+}
+
+async function openProjectOutput(projectName: string) {
+  await window.desktopApi.projects.openOutputDirectory(projectName);
+}
+
+async function removeProject(project: ProjectRecord) {
+  const label = project.projectName || "未命名项目";
+  if (!window.confirm(`删除项目“${label}”的工作台记录？\n\n会删除分镜、提示词和候选记录；不会删除输出目录及已下载文件，应用内部素材副本也不会自动清理。此操作不能撤销。`)) return;
+  await act(async () => {
+    await window.desktopApi.projects.remove(project.projectName);
+    if (selectedProjectName.value === project.projectName) selectedProjectName.value = "";
+    flash(`已删除“${label}”的工作台记录；磁盘文件仍保留`);
+  });
+}
+
 async function importStoryboardTasks() {
   const parsed = importPreview.value.storyboard;
   if (!parsed) return;
   await act(async () => {
-    const existing = projectStyleByName.value.get(parsed.projectName);
+    let targetProjectName = parsed.projectName;
+    if (projects.value.some((project) => project.projectName === targetProjectName)) {
+      const continueExisting = window.confirm(`项目“${targetProjectName}”已存在。\n\n确定：继续导入到现有项目\n取消：创建一个新的副本项目`);
+      if (!continueExisting) targetProjectName = uniqueProjectCopyName(targetProjectName);
+    }
+    const existing = projectStyleByName.value.get(targetProjectName);
     const inputs: TaskInput[] = parsed.shots.map((shot) => {
       const resolvedAsset = importAssetResolution.value?.shots.find((item) => item.shotNumber === shot.shotNumber)?.file;
       const inferredRatio = resolvedAsset ? inferAspectRatio(resolvedAsset.width, resolvedAsset.height) : shot.aspectRatio;
@@ -596,7 +666,7 @@ async function importStoryboardTasks() {
         ? shot.aspectRatio
         : existing?.lockedAspectRatio || (resolvedAsset ? inferredRatio : shot.aspectRatio);
       return {
-        projectName: parsed.projectName,
+        projectName: targetProjectName,
         shotNumber: shot.shotNumber,
         shotName: shot.shotName,
         narration: shot.narration,
@@ -622,7 +692,7 @@ async function importStoryboardTasks() {
     const useIncomingGlobals = incomingHasGlobals && (!existing || importGlobalChoice.value === "incoming");
     if (useIncomingGlobals || incomingReferencePaths.length || (!existing && importAssets.value.folderPath)) {
       await window.desktopApi.projects.saveStyle({
-        projectName: parsed.projectName,
+        projectName: targetProjectName,
         globalPrompt: useIncomingGlobals ? parsed.globalPrompt : existing?.globalPrompt ?? "",
         imageGlobalPrompt: useIncomingGlobals ? parsed.imageGlobalPrompt : existing?.imageGlobalPrompt ?? "",
         videoGlobalPrompt: useIncomingGlobals ? parsed.videoGlobalPrompt : existing?.videoGlobalPrompt ?? "",
@@ -641,6 +711,8 @@ async function importStoryboardTasks() {
       });
     }
     await window.desktopApi.tasks.importMany(inputs);
+    await window.desktopApi.projects.setStatus(targetProjectName, "active");
+    selectedProjectName.value = targetProjectName;
     let assignmentMessage = "";
     try {
       const summary = await window.desktopApi.tasks.autoAssign();
@@ -652,7 +724,7 @@ async function importStoryboardTasks() {
     importText.value = "";
     importProjectName.value = "";
     importAssets.value = { cancelled: false, folderPath: null, files: [] };
-    flash(`已导入 ${inputs.length} 个分镜${assignmentMessage}`);
+    flash(`已创建并切换到项目“${targetProjectName}”，导入 ${inputs.length} 个分镜${assignmentMessage}`);
   });
 }
 
@@ -925,6 +997,15 @@ function projectHasReferences(projectName: string) {
   return Boolean(profile?.characterReferencePaths.length || profile?.sceneReferencePath || profile?.styleReferencePath);
 }
 
+function projectStatusLabel(status: ProjectStatus) {
+  return ({ active: "制作中", completed: "已完成", archived: "已归档" } as Record<ProjectStatus, string>)[status];
+}
+
+function projectProgress(project: ProjectRecord) {
+  if (!project.shotCount) return "还没有分镜";
+  return `首帧 ${project.imageCompletedCount}/${project.shotCount} · 视频 ${project.videoCompletedCount}/${project.shotCount}`;
+}
+
 function videoStageLocked(task: TaskRecord) {
   return task.firstFrameSource !== "none" && task.imageStatus !== "approved";
 }
@@ -936,6 +1017,11 @@ function canCancelImageRegeneration(task: TaskRecord) {
     (task.imagePrepareState === "ready" && /(?:等待你在豆包点击生成|自动点击生成)/.test(task.imagePrepareStep)) ||
     task.imageStatus !== "approved"
   );
+}
+
+function hasGenerationRejection(task: TaskRecord, route: "image" | "video") {
+  const message = route === "image" ? task.imagePrepareMessage : task.videoPrepareMessage;
+  return Boolean(message && /豆包拒绝生成/.test(message));
 }
 
 function importReferenceFile(name: string) {
@@ -1052,6 +1138,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
         <button :class="{ active: activeTab === 'overview' }" @click="activeTab = 'overview'"><span>⌂</span>概览</button>
         <button :class="{ active: activeTab === 'accounts' }" @click="activeTab = 'accounts'"><span>◎</span>账号</button>
         <button :class="{ active: activeTab === 'tasks' }" @click="activeTab = 'tasks'"><span>▤</span>任务</button>
+        <button :class="{ active: activeTab === 'projects' }" @click="activeTab = 'projects'"><span>▦</span>项目库</button>
         <button :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'"><span>⚙</span>设置</button>
       </nav>
 
@@ -1067,9 +1154,9 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
       <header class="topbar">
         <div>
           <p class="eyebrow">LOCAL FIRST · SESSION ISOLATION</p>
-          <h1>{{ { overview: '工作台概览', accounts: '账号空间', tasks: '视频任务', settings: '运行设置' }[activeTab] }}</h1>
+          <h1>{{ { overview: '工作台概览', accounts: '账号空间', tasks: '视频任务', projects: '项目库', settings: '运行设置' }[activeTab] }}</h1>
         </div>
-        <button v-if="activeTab !== 'settings'" class="primary" @click="openAddAccount">＋ 添加账号</button>
+        <button v-if="activeTab === 'overview' || activeTab === 'accounts'" class="primary" @click="openAddAccount">＋ 添加账号</button>
       </header>
 
       <div v-if="notice" class="toast" :class="{ error: noticeError }">{{ notice }}</div>
@@ -1128,12 +1215,16 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
 
       <template v-else-if="activeTab === 'tasks'">
         <section class="task-toolbar">
-          <div><p class="eyebrow">STORYBOARD PIPELINE</p><h2>分镜图审核后再进入视频生成</h2></div>
-          <div><button @click="showImportDialog = true">批量导入分镜</button><button @click="openNewTask">＋ 新增分镜</button><button class="primary" @click="autoAssignTasks">自动分配账号</button></div>
+          <div class="project-switcher"><p class="eyebrow">CURRENT PROJECT</p><select v-model="selectedProjectName"><option value="">请选择项目</option><option v-for="project in projects.filter(item => item.status !== 'archived')" :key="project.projectName" :value="project.projectName">{{ project.projectName || '未命名项目' }} · {{ projectStatusLabel(project.status) }}</option></select></div>
+          <div><button class="primary" @click="openNewProject">＋ 新建 / 导入项目</button><button @click="activeTab = 'projects'">项目库 / 历史记录</button><button v-if="currentProject" @click="changeProjectStatus(currentProject.projectName, 'archived')">完成并归档</button></div>
+        </section>
+        <section v-if="currentProject" class="task-toolbar secondary-toolbar">
+          <div><strong>{{ currentProject.projectName || '未命名项目' }}</strong><span>{{ projectProgress(currentProject) }}</span></div>
+          <div><button @click="showImportDialog = true">继续导入分镜</button><button @click="openNewTask">＋ 新增分镜</button><button class="primary" @click="autoAssignTasks">自动分配账号</button></div>
         </section>
         <section class="panel task-list">
-            <div class="section-heading"><div><p class="eyebrow">LOCAL QUEUE</p><h2>分镜流水线</h2></div><span>{{ tasks.length }} 条</span></div>
-            <div v-if="tasks.length" class="task-groups">
+            <div class="section-heading"><div><p class="eyebrow">LOCAL QUEUE</p><h2>分镜流水线</h2></div><span>{{ currentProjectTasks.length }} 条</span></div>
+            <div v-if="currentProjectTasks.length" class="task-groups">
               <section v-for="group in taskGroups" :key="group.name" class="task-group">
                 <div class="task-group-head">
                   <div><strong>{{ group.name }}</strong><span>{{ taskGroupSummary(group.tasks) }}</span></div>
@@ -1221,6 +1312,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                     <div class="task-meta"><span><template v-if="hasProjectStyle(projectStyleByName.get(task.projectName))">全局提示词已合成</template></span><span>{{ formatTime(task.createdAt) }}</span></div>
                     <div v-if="task.firstFrameSource !== 'none'" class="card-actions stage-actions">
                       <button v-if="task.firstFrameSource === 'generated'" class="primary small" @click="openImageTask(task)">打开生图页</button>
+                      <button v-if="hasGenerationRejection(task, 'image')" class="primary small" @click="retryRejectedGeneration(task, 'image')">重试豆包拒绝</button>
                       <button v-if="task.firstFrameSource === 'generated' && (task.imageStatus === 'preparing' || task.imageStatus === 'failed' || task.imageStatus === 'pending')" @click="updateImageTask(task, 'submitted')">标记生图已提交</button>
                       <button v-if="task.firstFrameSource === 'generated' && task.imageStatus === 'submitted'" @click="updateImageTask(task, 'ready')">标记待审核</button>
                       <button v-if="task.firstFrameSource === 'local'" @click="chooseTaskImage(task)">选择本地首帧</button>
@@ -1230,6 +1322,7 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
                     </div>
                     <div class="card-actions stage-actions">
                       <button class="primary small" :disabled="videoStageLocked(task)" @click="openTask(task)">打开视频页</button>
+                      <button v-if="hasGenerationRejection(task, 'video')" class="primary small" :disabled="videoStageLocked(task)" @click="retryRejectedGeneration(task, 'video')">重试豆包拒绝</button>
                       <button :disabled="videoStageLocked(task)" @click="copyTaskPrompt(task)">复制视频提示词</button>
                       <button v-if="task.status === 'failed' || task.status === 'running'" :disabled="videoStageLocked(task)" @click="recheckVideoDownload(task)">重新检查并下载</button>
                       <button :disabled="videoStageLocked(task)" @click="importVideoCandidate(task)">导入视频候选</button>
@@ -1247,6 +1340,29 @@ function parameterSourceLabel(source: TaskRecord["modelSource"]) {
             </div>
             <div v-else class="empty inline"><strong>还没有任务</strong><span>可以保存单个分镜，也可以一次导入整套分镜。</span></div>
         </section>
+      </template>
+
+      <template v-else-if="activeTab === 'projects'">
+        <section class="task-toolbar">
+          <div><p class="eyebrow">PROJECT LIBRARY</p><h2>项目与历史记录</h2><p class="muted">归档只会从当前工作台隐藏，不会删除分镜、提示词、候选或磁盘文件。</p></div>
+          <div><button class="primary" @click="openNewProject">＋ 新建 / 导入项目</button></div>
+        </section>
+        <section v-if="projects.length" class="project-library-grid">
+          <article v-for="project in projects" :key="project.projectName" class="panel project-library-card">
+            <div class="project-library-head"><div><span class="badge" :class="project.status">{{ projectStatusLabel(project.status) }}</span><h3>{{ project.projectName || '未命名项目' }}</h3></div><small>{{ formatTime(project.updatedAt) }}</small></div>
+            <div class="project-stats"><span><b>{{ project.shotCount }}</b> 个分镜</span><span><b>{{ project.totalDuration }}</b> 秒</span><span>{{ projectProgress(project) }}</span></div>
+            <code class="path single-line" :title="project.outputDirectory">{{ project.outputDirectory }}</code>
+            <div class="card-actions">
+              <button class="primary small" @click="continueProject(project)">{{ project.status === 'archived' ? '恢复并继续' : '继续制作' }}</button>
+              <button @click="openProjectOutput(project.projectName)">打开输出文件夹</button>
+              <button v-if="project.status === 'active'" @click="changeProjectStatus(project.projectName, 'completed')">标记完成</button>
+              <button v-if="project.status !== 'archived'" @click="changeProjectStatus(project.projectName, 'archived')">归档</button>
+              <button v-else @click="changeProjectStatus(project.projectName, 'active')">恢复</button>
+              <button class="danger" @click="removeProject(project)">删除项目</button>
+            </div>
+          </article>
+        </section>
+        <section v-else class="empty"><strong>还没有项目</strong><span>导入一套分镜后，它会保存在项目库中。</span><button class="primary" @click="openNewProject">新建 / 导入项目</button></section>
       </template>
 
       <template v-else>

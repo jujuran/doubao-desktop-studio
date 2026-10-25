@@ -5,6 +5,7 @@ import type {
   AppSettings,
   ImageTaskStatus,
   ProjectReferenceKind,
+  ProjectStatus,
   ProjectStyleInput,
   TaskInput,
   TaskStatus,
@@ -14,7 +15,7 @@ import { initializeDataLocation, scheduleDataMigration } from "./data-location.j
 import { StudioDatabase } from "./database.js";
 import { DiagnosticsLogger, type DiagnosticLevel } from "./diagnostics.js";
 import { AccountSessionManager } from "./sessions.js";
-import { composeDeliveryPrompt } from "../src/prompt-compose.js";
+import { appendImageReferenceConstraint, composeDeliveryPrompt } from "../src/prompt-compose.js";
 import { inferAspectRatio } from "../src/storyboard-assets.js";
 
 const appDataPath = app.getPath("appData");
@@ -297,6 +298,22 @@ function registerIpc() {
       throw Object.assign(new Error(message), { task: updated });
     }
   });
+  ipcMain.handle("tasks:retry-rejected", (_event, id: string, route: "image" | "video") => {
+    const task = database.getTask(id);
+    const message = route === "image" ? task.imagePrepareMessage : task.videoPrepareMessage;
+    if (!message || !/豆包拒绝生成/.test(message)) throw new Error("当前任务没有可重试的豆包拒绝记录");
+    const accountId = route === "image" ? task.imageAccountId : task.accountId;
+    if (!accountId) throw new Error(route === "image" ? "请先为分镜图选择账号" : "请先为视频选择账号");
+    const projectStyle = database.getProjectStyle(task.projectName);
+    let prompt = composeDeliveryPrompt(route, route === "image" ? task.imagePrompt : task.prompt, projectStyle);
+    if (route === "image" && projectStyle?.characterReferencePaths.length) prompt = appendImageReferenceConstraint(prompt);
+    const initialRefusalCount = Number(/累计\s*(\d+)\s*次/.exec(message)?.[1] || 1);
+    database.setTaskPreparation(id, route, "running", "重试豆包拒绝生成", `保留当前对话和参考素材，正在第 ${initialRefusalCount + 1} 次尝试`);
+    startGenerationMonitor(id, route, accountId, prompt, { retryRejected: true, initialRefusalCount });
+    diagnostics.info("doubao_rejection_manual_retry", { taskId: shortTaskId(id), route, initialRefusalCount });
+    notifyChanged();
+    return database.getTask(id);
+  });
   ipcMain.handle("tasks:import-video-candidate", async (event, id: string) => {
     const task = database.getTask(id);
     const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
@@ -342,6 +359,20 @@ function registerIpc() {
     return usage;
   });
 
+  ipcMain.handle("projects:list", () => database.listProjects());
+  ipcMain.handle("projects:set-status", (_event, projectName: string, status: ProjectStatus) => {
+    const project = database.setProjectStatus(projectName, status);
+    notifyChanged();
+    return project;
+  });
+  ipcMain.handle("projects:remove", (_event, projectName: string) => {
+    database.deleteProject(projectName);
+    notifyChanged();
+  });
+  ipcMain.handle("projects:open-output-directory", async (_event, projectName: string) => {
+    const message = await shell.openPath(database.projectOutputDirectory(projectName));
+    if (message) throw new Error(`打开项目输出目录失败：${message}`);
+  });
   ipcMain.handle("projects:list-styles", () => database.listProjectStyles());
   ipcMain.handle("projects:save-style", (_event, input: ProjectStyleInput) => {
     const profile = database.saveProjectStyle(input);
@@ -539,7 +570,13 @@ async function prepareVideoTask(id: string) {
   }
 }
 
-function startGenerationMonitor(taskId: string, route: "image" | "video", accountId: string, prompt: string) {
+function startGenerationMonitor(
+  taskId: string,
+  route: "image" | "video",
+  accountId: string,
+  prompt: string,
+  retryOptions?: { retryRejected: boolean; initialRefusalCount: number }
+) {
   const monitorKey = `${taskId}:${route}`;
   const previous = activeGenerationMonitors.get(monitorKey);
   if (previous) previous.cancelled = true;
@@ -560,6 +597,8 @@ function startGenerationMonitor(taskId: string, route: "image" | "video", accoun
     imageAspectRatio: route === "image" ? task.aspectRatio : undefined,
     videoSettings: route === "video" ? { model: task.model, duration: task.duration, aspectRatio: task.aspectRatio } : undefined,
     expectsFirstFrame: route === "video" && task.firstFrameSource !== "none",
+    retryRejected: retryOptions?.retryRejected,
+    initialRefusalCount: retryOptions?.initialRefusalCount,
     shouldCancel: () => token.cancelled,
     onProgress(state, step) {
       try {
@@ -586,17 +625,18 @@ function startGenerationMonitor(taskId: string, route: "image" | "video", accoun
         diagnostics.warn("generation_progress_update_failed", { taskId: shortTaskId(taskId), route, message: errorMessage(error) });
       }
     }
-  }).then((items) => {
+  }).then(({ items, refusalCount }) => {
     database.addTaskCandidates(taskId, route, target.generationIndex, items);
+    const retryNote = refusalCount ? `（期间豆包拒绝 ${refusalCount} 次）` : "";
     if (route === "image") {
       database.setTaskImageStatus(taskId, "ready");
-      database.setTaskPreparation(taskId, route, "ready", `已下载 ${items.length} 张候选图，等待审核`);
+      database.setTaskPreparation(taskId, route, "ready", `已下载 ${items.length} 张候选图，等待审核${retryNote}`);
     } else {
       database.setTaskStatus(taskId, "review", null);
       const watermarkNote = items.some((item) => item.hasWatermark) ? "（豆包当前下载文件含平台水印）" : "";
-      database.setTaskPreparation(taskId, route, "ready", `原视频已下载，等待审核${watermarkNote}`);
+      database.setTaskPreparation(taskId, route, "ready", `原视频已下载，等待审核${watermarkNote}${retryNote}`);
     }
-    diagnostics.info("generation_download_completed", { taskId: shortTaskId(taskId), route, candidateCount: items.length });
+    diagnostics.info("generation_download_completed", { taskId: shortTaskId(taskId), route, candidateCount: items.length, refusalCount });
     notifyChanged();
   }).catch((error) => {
     const message = errorMessage(error);

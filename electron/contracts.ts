@@ -7,6 +7,19 @@ export type ParameterSource = "shot" | "project" | "first_frame" | "default";
 export type PreparationState = "idle" | "running" | "ready" | "failed";
 export type MediaCandidateKind = "image" | "video";
 export type MediaReviewStatus = "pending" | "approved" | "rejected";
+export type ProjectStatus = "active" | "completed" | "archived";
+
+export interface ProjectRecord {
+  projectName: string;
+  status: ProjectStatus;
+  shotCount: number;
+  totalDuration: number;
+  imageCompletedCount: number;
+  videoCompletedCount: number;
+  outputDirectory: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface MediaCandidate {
   id: string;
@@ -211,6 +224,7 @@ export interface DesktopApi {
     approveImageCandidate(id: string): Promise<TaskRecord>;
     reviewVideoCandidate(id: string, approved: boolean): Promise<TaskRecord>;
     recheckDownload(id: string): Promise<TaskRecord>;
+    retryRejected(id: string, route: "image" | "video"): Promise<TaskRecord>;
     importVideoCandidate(id: string): Promise<TaskRecord | null>;
     openCandidateFolder(id: string): Promise<void>;
     autoAssign(): Promise<AssignmentSummary>;
@@ -222,6 +236,10 @@ export interface DesktopApi {
     adjust(accountId: string, kind: UsageKind, value: number): Promise<AccountUsage>;
   };
   projects: {
+    list(): Promise<ProjectRecord[]>;
+    setStatus(projectName: string, status: ProjectStatus): Promise<ProjectRecord>;
+    remove(projectName: string): Promise<void>;
+    openOutputDirectory(projectName: string): Promise<void>;
     listStyles(): Promise<ProjectStyleProfile[]>;
     saveStyle(input: ProjectStyleInput): Promise<ProjectStyleProfile>;
     chooseReference(kind: ProjectReferenceKind): Promise<string[]>;

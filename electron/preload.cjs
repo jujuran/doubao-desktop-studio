@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
     approveImageCandidate: (id) => ipcRenderer.invoke("tasks:approve-image-candidate", id),
     reviewVideoCandidate: (id, approved) => ipcRenderer.invoke("tasks:review-video-candidate", id, approved),
     recheckDownload: (id) => ipcRenderer.invoke("tasks:recheck-download", id),
+    retryRejected: (id, route) => ipcRenderer.invoke("tasks:retry-rejected", id, route),
     importVideoCandidate: (id) => ipcRenderer.invoke("tasks:import-video-candidate", id),
     openCandidateFolder: (id) => ipcRenderer.invoke("tasks:open-candidate-folder", id),
     autoAssign: () => ipcRenderer.invoke("tasks:auto-assign"),
@@ -38,6 +39,10 @@ contextBridge.exposeInMainWorld("desktopApi", {
     adjust: (accountId, kind, value) => ipcRenderer.invoke("usage:adjust", accountId, kind, value)
   },
   projects: {
+    list: () => ipcRenderer.invoke("projects:list"),
+    setStatus: (projectName, status) => ipcRenderer.invoke("projects:set-status", projectName, status),
+    remove: (projectName) => ipcRenderer.invoke("projects:remove", projectName),
+    openOutputDirectory: (projectName) => ipcRenderer.invoke("projects:open-output-directory", projectName),
     listStyles: () => ipcRenderer.invoke("projects:list-styles"),
     saveStyle: (input) => ipcRenderer.invoke("projects:save-style", input),
     chooseReference: (kind) => ipcRenderer.invoke("projects:choose-reference", kind),

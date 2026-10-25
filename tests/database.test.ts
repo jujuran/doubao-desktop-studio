@@ -464,6 +464,40 @@ describe("StudioDatabase", () => {
     db.close();
   });
 
+  it("keeps project history, supports archive/restore, and does not delete output files", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-projects-"));
+    tempDirs.push(dir);
+    const outputDirectory = path.join(dir, "output");
+    const outputFile = path.join(outputDirectory, "成片.mp4");
+    const db = new StudioDatabase(path.join(dir, "data"));
+    const task = db.createTask({
+      projectName: "历史项目",
+      shotNumber: 1,
+      imagePrompt: "",
+      imageAccountId: null,
+      accountId: null,
+      prompt: "柯基跑过客厅",
+      model: "Seedance 2.0 mini",
+      duration: 10,
+      aspectRatio: "16:9"
+    });
+    db.saveProjectStyle({
+      projectName: "历史项目", globalPrompt: "", imageGlobalPrompt: "", videoGlobalPrompt: "",
+      migrationPending: false, characterReferencePaths: [], sceneReferencePath: null, styleReferencePath: null,
+      outputDirectory, lockedModel: null, lockedAspectRatio: null
+    });
+    writeFileSync(outputFile, "video");
+
+    expect(db.listProjects()[0]).toMatchObject({ projectName: "历史项目", shotCount: 1, totalDuration: 10, status: "active" });
+    expect(db.setProjectStatus("历史项目", "archived").status).toBe("archived");
+    expect(db.setProjectStatus("历史项目", "active").status).toBe("active");
+    db.deleteProject("历史项目");
+    expect(db.listProjects()).toEqual([]);
+    expect(() => db.getTask(task.id)).toThrow(/不存在/);
+    expect(existsSync(outputFile)).toBe(true);
+    db.close();
+  });
+
   it("migrates old style fields into inactive global-prompt drafts", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "doubao-studio-style-migration-"));
     tempDirs.push(dir);

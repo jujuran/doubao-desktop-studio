@@ -14,6 +14,8 @@ import type {
   MediaCandidate,
   MediaCandidateKind,
   PreparationState,
+  ProjectRecord,
+  ProjectStatus,
   ProjectStyleInput,
   ProjectStyleProfile,
   TaskInput,
@@ -133,6 +135,12 @@ export class StudioDatabase {
         locked_aspect_ratio TEXT,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS projects (
+        project_name TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_media_candidates_task ON media_candidates(task_id, kind, generation_index, candidate_index);
     `);
@@ -227,6 +235,12 @@ export class StudioDatabase {
         AND character_reference_paths_json = '[]'
     `);
     this.createLegacyStyleDrafts();
+    this.db.exec(`
+      INSERT OR IGNORE INTO projects(project_name, status, created_at, updated_at)
+      SELECT project_name, 'active', MIN(created_at), MAX(updated_at) FROM tasks GROUP BY project_name;
+      INSERT OR IGNORE INTO projects(project_name, status, created_at, updated_at)
+      SELECT project_name, 'active', updated_at, updated_at FROM project_styles;
+    `);
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("maxActiveWorkers", "3");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("automationEnabled", "false");
     this.db.prepare("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)").run("autoClickGenerate", "false");
@@ -290,6 +304,61 @@ export class StudioDatabase {
 
   listTasks(): TaskRecord[] {
     return (this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all() as DbRow[]).map((row) => this.enrichTask(rowToTask(row)));
+  }
+
+  listProjects(): ProjectRecord[] {
+    return (this.db.prepare(`
+      SELECT p.project_name, p.status, p.created_at, p.updated_at,
+        COALESCE(MAX(t.updated_at), p.updated_at) AS task_updated_at,
+        s.updated_at AS style_updated_at,
+        COUNT(t.id) AS shot_count,
+        COALESCE(SUM(CASE WHEN t.duration > 0 THEN t.duration ELSE 0 END), 0) AS total_duration,
+        COALESCE(SUM(CASE WHEN t.image_status IN ('approved', 'skipped') THEN 1 ELSE 0 END), 0) AS image_completed_count,
+        COALESCE(SUM(CASE WHEN t.status = 'succeeded' THEN 1 ELSE 0 END), 0) AS video_completed_count,
+        COALESCE(s.output_directory, '') AS output_directory
+      FROM projects p
+      LEFT JOIN tasks t ON t.project_name = p.project_name
+      LEFT JOIN project_styles s ON s.project_name = p.project_name
+      GROUP BY p.project_name, p.status, p.created_at, p.updated_at, s.updated_at, s.output_directory
+      ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END, task_updated_at DESC
+    `).all() as DbRow[]).map((row) => rowToProject(row, this.dataDir));
+  }
+
+  setProjectStatus(projectName: string, status: ProjectStatus): ProjectRecord {
+    this.ensureProject(projectName);
+    this.db.prepare("UPDATE projects SET status = ?, updated_at = ? WHERE project_name = ?").run(status, now(), projectName);
+    return this.listProjects().find((project) => project.projectName === projectName)!;
+  }
+
+  deleteProject(projectName: string) {
+    this.ensureProject(projectName);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM tasks WHERE project_name = ?").run(projectName);
+      this.db.prepare("DELETE FROM project_styles WHERE project_name = ?").run(projectName);
+      this.db.prepare("DELETE FROM projects WHERE project_name = ?").run(projectName);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  projectOutputDirectory(projectName: string) {
+    this.ensureProject(projectName);
+    const outputDirectory = this.getProjectStyle(projectName)?.outputDirectory
+      || path.join(this.dataDir, "projects", safeFilePart(projectName || "未命名项目"));
+    mkdirSync(outputDirectory, { recursive: true });
+    return outputDirectory;
+  }
+
+  private ensureProject(projectName: string) {
+    const timestamp = now();
+    this.db.prepare(`
+      INSERT INTO projects(project_name, status, created_at, updated_at)
+      VALUES (?, 'active', ?, ?)
+      ON CONFLICT(project_name) DO NOTHING
+    `).run(projectName, timestamp, timestamp);
   }
 
   getTask(id: string): TaskRecord {
@@ -470,6 +539,7 @@ export class StudioDatabase {
 
   createTask(input: TaskInput): TaskRecord {
     const normalized = this.validateTaskInput(input);
+    this.ensureProject(normalized.projectName);
     const id = randomUUID();
     const createdAt = now();
     const imagePath = normalized.sourceImagePath ? this.storeManagedImage(normalized.sourceImagePath) : null;
@@ -526,6 +596,7 @@ export class StudioDatabase {
   updateTask(id: string, input: TaskInput): TaskRecord {
     const previous = this.getTask(id);
     const normalized = this.validateTaskInput(input);
+    this.ensureProject(normalized.projectName);
     const sourceChanged = previous.firstFrameSource !== normalized.firstFrameSource;
     const promptChanged = previous.imagePrompt !== normalized.imagePrompt;
     let imagePath = previous.imagePath;
@@ -742,6 +813,7 @@ export class StudioDatabase {
   saveProjectStyle(input: ProjectStyleInput): ProjectStyleProfile {
     const projectName = input.projectName.trim();
     if (!projectName) throw new Error("请先填写项目名称，再设置风格锁定");
+    this.ensureProject(projectName);
     const characterReferences = dedupeReferences(input.characterReferencePaths.map((sourcePath, index) => ({
       ...this.storeManagedProjectReference(sourcePath),
       name: input.characterReferenceNames?.[index] || path.basename(sourcePath)
@@ -1092,6 +1164,25 @@ function rowToMediaCandidate(row: DbRow): MediaCandidate {
     reviewStatus: String(row.review_status || "pending") as MediaCandidate["reviewStatus"],
     hasWatermark: Boolean(Number(row.has_watermark || 0)),
     createdAt: String(row.created_at)
+  };
+}
+
+function rowToProject(row: DbRow, dataDir: string): ProjectRecord {
+  const projectName = String(row.project_name || "");
+  const timestamps = [row.updated_at, row.task_updated_at, row.style_updated_at]
+    .filter((value): value is string | number => value !== null)
+    .map(String)
+    .sort();
+  return {
+    projectName,
+    status: String(row.status || "active") as ProjectStatus,
+    shotCount: Math.max(0, Number(row.shot_count) || 0),
+    totalDuration: Math.max(0, Number(row.total_duration) || 0),
+    imageCompletedCount: Math.max(0, Number(row.image_completed_count) || 0),
+    videoCompletedCount: Math.max(0, Number(row.video_completed_count) || 0),
+    outputDirectory: String(row.output_directory || path.join(dataDir, "projects", safeFilePart(projectName || "未命名项目"))),
+    createdAt: String(row.created_at),
+    updatedAt: timestamps.at(-1) || String(row.created_at)
   };
 }
 

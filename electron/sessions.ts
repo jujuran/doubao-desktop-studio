@@ -25,6 +25,7 @@ import {
   newGeneratedImageUrls,
   type DoubaoImageCandidateSnapshot
 } from "../src/doubao-image.js";
+import { detectDoubaoRejection, refusalFailureMessage } from "../src/doubao-rejection.js";
 
 const DOUBAO_HOME = "https://www.doubao.com/";
 const DOUBAO_CHAT = "https://www.doubao.com/chat/";
@@ -62,6 +63,8 @@ export interface GenerationMonitorOptions {
   imageAspectRatio?: string;
   videoSettings?: DoubaoVideoSettings;
   expectsFirstFrame?: boolean;
+  retryRejected?: boolean;
+  initialRefusalCount?: number;
   onProgress?: (state: "waiting" | "started" | "completed", step: string) => void;
   shouldCancel?: () => boolean;
 }
@@ -70,6 +73,17 @@ export interface DownloadedGenerationCandidate {
   sourceUrl: string;
   filePath: string;
   hasWatermark: boolean;
+}
+
+export interface GenerationMonitorResult {
+  items: DownloadedGenerationCandidate[];
+  refusalCount: number;
+}
+
+class GenerationRejectedError extends Error {
+  constructor(readonly responseText: string, readonly snapshot: GenerationSnapshot) {
+    super(responseText);
+  }
 }
 
 export class AccountSessionManager {
@@ -236,10 +250,12 @@ export class AccountSessionManager {
     return { win, prompt: preparedPrompt };
   }
 
-  async monitorGeneration(account: Account, options: GenerationMonitorOptions): Promise<DownloadedGenerationCandidate[]> {
+  async monitorGeneration(account: Account, options: GenerationMonitorOptions): Promise<GenerationMonitorResult> {
     const win = this.windows.get(account.id);
     if (!win || win.isDestroyed()) throw new Error("豆包窗口已关闭，无法监测生成结果");
-    const baseline = await readGenerationSnapshot(win, options.route);
+    let baseline = await readGenerationSnapshot(win, options.route);
+    let refusalCount = Math.max(0, options.initialRefusalCount || 0);
+    let automaticRetries = 0;
     if (options.route === "image") {
       this.events.onDiagnostic("info", "image_generation_baseline", {
         accountId: shortAccountId(account.id),
@@ -247,31 +263,58 @@ export class AccountSessionManager {
         roleCounts: imageRoleCounts(baseline.imageCandidates)
       });
     }
-    if (options.autoClick) {
-      options.onProgress?.("waiting", "自动点击生成");
-      await verifyBeforeSubmit(win, options);
-      if (!await clickGenerateButton(win)) throw new Error("生成前核对已通过，但没有找到可点击的生成按钮");
-    } else {
-      options.onProgress?.("waiting", "等待你在豆包点击生成");
+    let shouldSubmitRetry = Boolean(options.retryRejected);
+    let completed: GenerationSnapshot;
+    while (true) {
+      try {
+        if (shouldSubmitRetry) {
+          options.onProgress?.("waiting", refusalCount ? `重试豆包拒绝生成（累计 ${refusalCount} 次）` : "重试豆包拒绝生成");
+          if (!await retryRejectedGeneration(win, options.prompt)) throw new Error("没有找到“重新生成”按钮，也未能重新发送提示词");
+        } else if (options.autoClick) {
+          options.onProgress?.("waiting", "自动点击生成");
+          await verifyBeforeSubmit(win, options);
+          if (!await clickGenerateButton(win)) throw new Error("生成前核对已通过，但没有找到可点击的生成按钮");
+        } else {
+          options.onProgress?.("waiting", "等待你在豆包点击生成");
+        }
+        const started = options.route === "video"
+          ? await waitForVideoGenerationStart(win, baseline, options.autoClick || shouldSubmitRetry, options.onProgress)
+          : await waitForGenerationStart(win, baseline, options.route, 30 * 60_000, options.shouldCancel);
+        if (!started) throw new Error("等待手动点击生成超时，请重新打开任务");
+        options.onProgress?.("started", options.route === "image" ? "生图中" : "视频生成中");
+        completed = await waitForGenerationCompletion(
+          win,
+          baseline,
+          options.route,
+          options.onProgress,
+          options.shouldCancel,
+          options.route === "image" ? (snapshot, urls) => this.events.onDiagnostic("info", "image_generation_result_detected", {
+            accountId: shortAccountId(account.id),
+            candidateCount: snapshot.imageCandidates.length,
+            roleCounts: imageRoleCounts(snapshot.imageCandidates),
+            newResultCount: urls.length
+          }) : undefined
+        );
+        break;
+      } catch (error) {
+        if (!(error instanceof GenerationRejectedError)) throw error;
+        refusalCount += 1;
+        this.events.onDiagnostic("warn", "doubao_generation_rejected", {
+          accountId: shortAccountId(account.id),
+          route: options.route,
+          refusalCount,
+          responseText: error.responseText
+        });
+        if (!options.autoClick || automaticRetries >= 2) {
+          throw new Error(refusalFailureMessage(error.responseText, refusalCount));
+        }
+        automaticRetries += 1;
+        options.onProgress?.("waiting", `豆包拒绝生成（第 ${refusalCount} 次），3 秒后自动重试 ${automaticRetries}/2`);
+        await delay(3_000);
+        baseline = error.snapshot;
+        shouldSubmitRetry = true;
+      }
     }
-    const started = options.route === "video"
-      ? await waitForVideoGenerationStart(win, baseline, options.autoClick, options.onProgress)
-      : await waitForGenerationStart(win, baseline, options.route, 30 * 60_000, options.shouldCancel);
-    if (!started) throw new Error("等待手动点击生成超时，请重新打开任务");
-    options.onProgress?.("started", options.route === "image" ? "生图中" : "视频生成中");
-    const completed = await waitForGenerationCompletion(
-      win,
-      baseline,
-      options.route,
-      options.onProgress,
-      options.shouldCancel,
-      options.route === "image" ? (snapshot, urls) => this.events.onDiagnostic("info", "image_generation_result_detected", {
-        accountId: shortAccountId(account.id),
-        candidateCount: snapshot.imageCandidates.length,
-        roleCounts: imageRoleCounts(snapshot.imageCandidates),
-        newResultCount: urls.length
-      }) : undefined
-    );
     options.onProgress?.("completed", options.route === "image" ? "下载分镜图候选" : "下载原视频");
     mkdirSync(options.outputFolder, { recursive: true });
     if (options.route === "image") {
@@ -286,9 +329,9 @@ export class AccountSessionManager {
         writeFileSync(filePath, Buffer.from(await response.arrayBuffer()));
         results.push({ sourceUrl, filePath, hasWatermark: false });
       }
-      return results;
+      return { items: results, refusalCount };
     }
-    return [await downloadOfficialOriginal(
+    return { items: [await downloadOfficialOriginal(
       win,
       options.outputFolder,
       options.baseName,
@@ -296,7 +339,7 @@ export class AccountSessionManager {
         accountId: shortAccountId(account.id),
         ...details
       })
-    )];
+    )], refusalCount };
   }
 
   async downloadLatestVideo(account: Account, outputFolder: string, baseName: string) {
@@ -452,7 +495,9 @@ async function enterImageGeneration(win: BrowserWindow) {
   if (await active()) return;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await dismissDesktopDownloadPrompt(win);
-    if (!await clickVisibleText(win, ["图像生成"], true)) {
+    let clicked = await clickVisibleText(win, ["图像生成"], true);
+    if (!clicked) clicked = await enterGenerationViaSkillMenu(win, "图像生成");
+    if (!clicked) {
       if (await clickVisibleText(win, ["AI 创作"], true)) {
         await delay(700);
         await clickVisibleText(win, ["图像"], true);
@@ -461,7 +506,7 @@ async function enterImageGeneration(win: BrowserWindow) {
     if (await waitUntil(active, 5_000, 350)) return;
     await delay(500);
   }
-  throw new Error("没有确认豆包已切换到图像生成技能");
+  throw new Error("这个账号的豆包界面找不到图像生成入口（已尝试快捷入口、“技能”菜单和 AI 创作）");
 }
 
 async function applyImageAspectRatio(win: BrowserWindow, aspectRatio: string) {
@@ -588,12 +633,23 @@ async function enterVideoGeneration(win: BrowserWindow) {
       clicked = await clickVisibleText(win, ["视频生成"], true)
         || await clickVisibleText(win, ["视频生成"], false);
     }
+    if (!clicked) clicked = await enterGenerationViaSkillMenu(win, "视频生成");
     if (clicked && await waitUntil(() => isVideoGenerationActive(win), 5_000, 350)) return;
     if (await enterAiCreationVideo(win)) return;
     await delay(700);
   }
   const snapshot = await readVideoGenerationSnapshot(win);
-  throw new Error(`已重试 3 次，但没有确认视频生成激活状态（标签：${snapshot.modeLabels.join("/") || "未识别"}；输入提示：${snapshot.composerPlaceholders.join("/") || "未识别"}；控件：${snapshot.controlTexts.filter((value) => /Seedance|自动|\d+:\d+/.test(value)).slice(0, 4).join("/") || "未识别"}）`);
+  throw new Error(`这个账号的豆包界面找不到视频生成入口（已尝试快捷入口、“更多”、“技能”菜单和 AI 创作；标签：${snapshot.modeLabels.join("/") || "未识别"}；输入提示：${snapshot.composerPlaceholders.join("/") || "未识别"}）`);
+}
+
+async function enterGenerationViaSkillMenu(win: BrowserWindow, target: "图像生成" | "视频生成") {
+  if (!await clickVisibleText(win, ["技能"], true)) return false;
+  await delay(500);
+  const menuReady = await waitUntil(() => hasVisibleText(win, [target], true), 4_000, 250);
+  if (!menuReady) return false;
+  const clicked = await clickVisibleText(win, [target], true) || await clickVisibleText(win, [target], false);
+  if (clicked) await delay(500);
+  return clicked;
 }
 
 async function dismissDesktopDownloadPrompt(win: BrowserWindow) {
@@ -1180,6 +1236,43 @@ async function clickGenerateButton(win: BrowserWindow) {
   return true;
 }
 
+async function retryRejectedGeneration(win: BrowserWindow, prompt: string) {
+  if (await clickLatestVisibleText(win, ["重新生成", "重新尝试", "再试一次", "重试"])) {
+    await delay(500);
+    return true;
+  }
+  if (!await fillAndConfirmComposer(win, prompt)) return false;
+  return clickGenerateButton(win);
+}
+
+async function clickLatestVisibleText(win: BrowserWindow, labels: string[]) {
+  const point = await win.webContents.executeJavaScript(`
+    (() => {
+      const labels = ${JSON.stringify(labels)}.map(value => value.replace(/\\s+/g, '').toLowerCase());
+      const visible = element => { const r = element.getBoundingClientRect(); const s = getComputedStyle(element); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; };
+      const matches = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [tabindex]')).filter(element => {
+        if (!visible(element) || element.disabled || element.getAttribute('aria-disabled') === 'true') return false;
+        const text = (element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, '').toLowerCase();
+        return labels.some(label => text === label || text.includes(label));
+      }).sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      const element = matches[0];
+      if (!element) return null;
+      const rect = element.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    })()
+  `, true) as { x: number; y: number } | null;
+  if (!point) return false;
+  await clickPoint(win, point.x, point.y);
+  return true;
+}
+
+function throwIfGenerationRejected(baseline: GenerationSnapshot, current: GenerationSnapshot) {
+  const responseText = detectDoubaoRejection(baseline.bodyText, current.bodyText);
+  const hasNewImage = newGeneratedImageUrls(new Set(baseline.imageUrls), current.imageCandidates).length > 0;
+  const hasNewVideo = current.videoCardCount > baseline.videoCardCount;
+  if (responseText && !hasNewImage && !hasNewVideo) throw new GenerationRejectedError(responseText, current);
+}
+
 async function waitForGenerationStart(
   win: BrowserWindow,
   baseline: GenerationSnapshot,
@@ -1191,6 +1284,7 @@ async function waitForGenerationStart(
     if (shouldCancel?.()) throw new Error("已取消重新生图");
     if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
     const current = await readGenerationSnapshot(win, route);
+    throwIfGenerationRejected(baseline, current);
     const failure = generationFailure(current.bodyText);
     if (failure) throw new Error(failure);
     const composerCleared = normalizeComposerText(current.composerText) === "" && normalizeComposerText(baseline.composerText) !== "";
@@ -1213,6 +1307,7 @@ async function waitForVideoGenerationStart(
   while (true) {
     if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
     const current = await readGenerationSnapshot(win, "video");
+    throwIfGenerationRejected(baseline, current);
     const recentText = current.bodyText.slice(-6_000);
     const safetyConfirmation = /安全确认|上传素材.{0,30}(?:已获|获得).{0,12}授权|确认.{0,20}(?:拥有|获得).{0,12}授权/.test(recentText);
     const confirmationRequested = /确认后我再开始生成视频|确认后(?:再)?开始生成|请确认(?:后)?(?:我再)?开始生成/.test(recentText);
@@ -1295,6 +1390,7 @@ async function waitForGenerationCompletion(
     if (shouldCancel?.()) throw new Error("已取消重新生图");
     if (win.isDestroyed()) throw new Error("豆包窗口已关闭");
     const current = await readGenerationSnapshot(win, route);
+    throwIfGenerationRejected(baseline, current);
     const failure = generationFailure(current.bodyText);
     if (failure && route === "image") throw new Error(failure);
     const imageUrls = newGeneratedImageUrls(beforeImages, current.imageCandidates);
